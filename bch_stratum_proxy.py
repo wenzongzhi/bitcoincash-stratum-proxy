@@ -196,6 +196,7 @@ def normalize_nbits_be(bits: Any) -> str:
 # ===========================
 # === RPC 封装（带重试）===
 # ===========================
+# '= None' means List is optional params
 def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
     url = f"http://{RPC_HOST}:{RPC_PORT}"
     headers = {"content-type": "application/json"}
@@ -207,7 +208,7 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
             resp.raise_for_status()
             data = resp.json()
             if data.get('error'):
-                # 若 error != null 则返回 None 并记录
+                # resp.json() will put json into dict, key is error or result. if error != null, this function will return None
                 log(f"RPC error for {method}:", data['error'])
                 return None
             return data.get('result')
@@ -915,16 +916,21 @@ def start_stratum_server(listen_host: str, listen_port: int):
             sock.close()
         except:
             pass
-
-# ===========================
-# === 主程序入口 ===
-# ===========================
-if __name__ == "__main__":
+            
+def main():
     if RPC_USER == "your_rpc_user" or RPC_PASS == "your_rpc_password":
-        print("请先在脚本顶部配置 RPC_USER 和 RPC_PASS（bitcoin.conf 中的 rpc 用户/密码）")
+        print("Please configure RPC_USER and RPC_PASS (RPC user/password in bitcoin.conf) at the top of the script first")
         exit(1)
-
+    
+    # 'daemon=True' means if main thread is end, this child Thread will be killed.
     poller_thread = threading.Thread(target=gbt_poller, daemon=True)
-    poller_thread.start()
+    poller_thread.start()   # run child thread gbt_poller   
 
-    start_stratum_server(LISTEN_HOST, LISTEN_PORT)
+    start_stratum_server(LISTEN_HOST, LISTEN_PORT)  # run main thread start_stratum_server
+    
+# ===========================
+# === mainloop entry ===
+# ===========================
+# If this Python script is run standalone, the value of __name__ will be equal to __main__, and main() will running
+if __name__ == "__main__":
+    main()
