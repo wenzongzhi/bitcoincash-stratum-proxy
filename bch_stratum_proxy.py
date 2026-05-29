@@ -1,3 +1,18 @@
+"""
+Copyright 2026 温中志 (Wen Zhongzhi)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
 
 from ecashaddress import convert
 import base58  # pip install base58
@@ -193,25 +208,26 @@ def normalize_nbits_be(bits: Any) -> str:
         # 十进制字符串
         return int_to_be_hex(int(s), 4)
 
-# ===========================
-# === RPC 封装（带重试）===
-# ===========================
+# =====================================
+# === RPC encapsulation (with retry)===
+# =====================================
 # '= None' means List is optional params
 def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
-    url = f"http://{RPC_HOST}:{RPC_PORT}"
+    url = f"http://{RPC_HOST}:{RPC_PORT}"   # f key word is mean format the string
     headers = {"content-type": "application/json"}
     payload = {"jsonrpc": "2.0", "id": "proxy", "method": method, "params": params or []}
     attempt = 0
     while attempt < RPC_MAX_RETRIES:
         try:
             resp = requests.post(url, json=payload, headers=headers, auth=(RPC_USER, RPC_PASS), timeout=RPC_TIMEOUT)
-            resp.raise_for_status()
+            # requests.post(url, json, headers, auth, timeout)
+            resp.raise_for_status()     # If there is an HTTP error, throw an exception.      
             data = resp.json()
             if data.get('error'):
                 # resp.json() will put json into dict, key is error or result. if error != null, this function will return None
                 log(f"RPC error for {method}:", data['error'])
                 return None
-            return data.get('result')
+            return data.get('result')   # result object should be the whole block template data
         except Exception as e:
             attempt += 1
             log(f"RPC call {method} attempt {attempt} failed:", e)
@@ -249,7 +265,7 @@ def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
 
 def build_coinbase_tx(height: int, payout_address: str, coinbase_value: int, extranonce_placeholder: str) -> str:
     """
-    手动构造 coinbase 交易
+    Manually construct coinbase transaction
     """
     # 1. version
     version = "01000000"
@@ -349,7 +365,7 @@ def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         # 1) header components
-        version = int(gbt.get('version', 0))
+        version = int(gbt.get('version', 0))    # example, version = 536870912 (0x20000000)
         # Stratum 通常期望大端(hex)用于显示，但 core RPC 的整数是主机整数，转换如下:
         version_be = int_to_be_hex(version, 4)
 
@@ -439,38 +455,38 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 def broadcast_job_to_miners(job: Dict[str, Any]):
-    """将 job 广播给所有已订阅并已授权的矿机（线程安全）"""
+    """Broadcast the job to all subscribed and authorized mining machines (thread safe)"""
     with _miners_lock:
         miners_copy = list(_miners)
     for m in miners_copy:
         try:
             m.send_job(job)
         except Exception as e:
-            log("向矿机广播 job 失败，移除矿机:", e)
+            log("Broadcast job to mining machine failed, remove mining machine:", e)
             try:
                 m.close()
             except:
                 pass
 
-# ===========================
-# === GBT 轮询线程 (后台) ===
-# ===========================
+# ======================================
+# === GBT Polling thread (background)===
+# ======================================
 def gbt_poller():
     global _current_gbt, _current_job, _current_height
-    log("GBT 轮询器启动, 间隔:", GBT_POLL_INTERVAL, "秒")
+    log("GBT polling start, Interval:", GBT_POLL_INTERVAL, "seconds")
     last_txids = None
     while True:
         try:
-            # 请求 getblocktemplate，要求 coinbasetxn 支持
-            # params 可根据节点支持调整
+            # request getblocktemplate, request coinbasetxn 支持(???)
+            # params can be adjusted according to node support
             # gbt = rpc_call("getblocktemplate", [{"capabilities": ["coinbasetxn", "workid"]}])
-            gbt = rpc_call("getblocktemplate", [{"rules": ["segwit"]}])
+            gbt = rpc_call("getblocktemplate", [{"rules": ["segwit"]}])     # remove ["segwit"] ??? 
             if not gbt:
                 time.sleep(GBT_POLL_INTERVAL)
                 continue
 
-            height = gbt.get('height', -1)
-            # 获取 txid 列表（以便检测 mempool 更新）
+            height = gbt.get('height', -1)  # if can't get valid height value, return -1
+            # get txid data, (in order to check the mempool update), txids = ("txid1", "txid2", "txid3",...)
             txids = tuple(tx.get('txid') for tx in gbt.get('transactions', []))
 
             need_broadcast = False
@@ -478,30 +494,30 @@ def gbt_poller():
             with _gbt_lock:
                 if _current_gbt is None:
                     need_broadcast = True
-                    reason = "初始化 GBT"
+                    reason = "initial GBT"
                 elif gbt.get('previousblockhash') != _current_gbt.get('previousblockhash'):
                     need_broadcast = True
-                    reason = f"检测到新区块，高度 {height}"
+                    reason = f"detected new block, height is {height}"
                 elif txids != last_txids:
                     need_broadcast = True
-                    reason = f"检测到 Mempool 变化，tx_count={len(txids)}"
+                    reason = f"detected Mempool changed, tx_count={len(txids)}"
                 elif gbt.get('coinbasevalue') != _current_gbt.get('coinbasevalue'):
                     need_broadcast = True
-                    reason = "检测到 coinbasevalue 变化"
+                    reason = "detected coinbasevalue changed"
 
-                # 更新缓存
+                # update cache
                 if need_broadcast:
-                    _current_gbt = gbt
+                    _current_gbt = gbt  # store new gbt dict data to _current_gbt
                     _current_job = build_job_from_gbt(gbt)
                     _current_height = height
                     last_txids = txids
 
             if need_broadcast and _current_job:
-                log("广播新工作:", reason, "height=", height, "txs=", len(txids))
+                log("boardcast new job to ASIC:", reason, "height=", height, "txs=", len(txids))
                 broadcast_job_to_miners(_current_job)
             time.sleep(GBT_POLL_INTERVAL)
         except Exception as e:
-            log("GBT 轮询异常:", e)
+            log("GBT polling exception", e)
             time.sleep(GBT_POLL_INTERVAL)
 
 # ===========================
