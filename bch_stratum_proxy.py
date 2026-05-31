@@ -63,7 +63,7 @@ RPC_RETRY_BACKOFF = 2  # 指数退避基数
 
 # 日志输出开关
 DEBUG = True
-MAX_MINERS = 200
+MAX_MINERS = 20
 
 # ===========================
 # === 全局状态（内部使用）===
@@ -72,11 +72,12 @@ _current_gbt: Optional[Dict[str, Any]] = None
 _current_job: Optional[Dict[str, Any]] = None
 _current_height: int = -1
 
-# 管理所有连接的矿机 handler 列表
+# Manage the list of all connected miner handlers
+# use thread lock to make sure same resource only changed by one thread
 _miners_lock = threading.Lock()
 _miners: List["StratumMinerHandler"] = []
 
-# 保护 GBT 与 job 的锁
+# lock protecting GBT and job
 _gbt_lock = threading.Lock()
 
 # ===========================
@@ -235,9 +236,9 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
     return None
 
 # ===========================
-# === GBT -> Job 转换与广播 ===
+# === GBT -> Job Conversion and Broadcast ===
 # ===========================
-def _encode_height_to_coinbase(height: int) -> str:
+def _encode_height_to_coinbase(height: int) -> str: # here need to do some optimized
     hb = b''
     n = height
     while True:
@@ -248,7 +249,7 @@ def _encode_height_to_coinbase(height: int) -> str:
     return bytes_to_hex(bytes([len(hb)])) + bytes_to_hex(hb)
 
 def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
-    # 极简 coinbase tx，仅用于节点未返回 coinbasetxn.data 的极端情况
+    # A minimal coinbase tx, used only in the extreme case where the node does not return coinbasetxn.data.
     version = "01000000"
     tx_in_count = "01"
     prev_out = "00" * 32 + "ffffffff"
@@ -262,12 +263,14 @@ def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
     lock_time = "00000000"
     return version + tx_in_count + prev_out + script_len + script_hex + seq + tx_out_count + value + pk_script_len + pk_script + lock_time
 
-def build_coinbase_tx(height: int, payout_address: str, coinbase_value: int, extranonce_placeholder: str) -> str:
+def build_coinbase_1(height: int) -> str:
     """
     Manually construct coinbase transaction
     """
+    print("need to do")
+    '''
     # 1. version
-    version = "01000000"
+    version = "02000000" # need to change?
 
     # 2. input count
     in_count = "01"
@@ -311,6 +314,10 @@ def build_coinbase_tx(height: int, payout_address: str, coinbase_value: int, ext
         script_len + coinbase_script + sequence +
         out_count + value_hex + script_len_out + script + locktime
     )
+    '''
+
+def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
+    print("need to do")
     
 # 计算从 coinbase 到 root 的路径
 def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -> List[str]:
@@ -384,10 +391,11 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         curtime = int(gbt.get('curtime', int(time.time())))
         ntime_be = int_to_be_hex(curtime, 4)
 
-        # 2) coinbase 处理: 优先使用 coinbasetxn.data (BCH 节点常见)
+        # 2) coinbase deal: Bitcoin can use coinbasetxn.data, Bitcoincash doesn't support coinbasetxn.data 
 
         coinb1 = ''
         coinb2 = ''
+        '''
         placeholder_found = False  # MODIFIED
 
         coinbasetxn = gbt.get('coinbasetxn')
@@ -406,16 +414,16 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 coinb2 = ''
                 placeholder_found = False
         else:
-            # 没有 coinbasetxn，需手动构造
-            height = gbt.get('height')
-            coinbase_value = gbt.get('coinbasevalue', 0)
-            if height is None or coinbase_value == 0:
-                return None
-            # 使用默认地址或配置地址
-            coinbase_hex = build_coinbase_tx(height, DEFAULT_PAYOUT_ADDRESS, coinbase_value, EXTRANONCE_PLACEHOLDER)
-            coinb1 = coinbase_hex
-            coinb2 = ''
-            placeholder_found = False
+        '''
+        # no coinbasetxn, manually creat
+        height = gbt.get('height')
+        coinbase_value = gbt.get('coinbasevalue', 0)
+        if height is None or coinbase_value == 0:
+            return None
+        # 使用默认地址或配置地址
+        coinb1 = build_coinbase_1(height)
+        coinb2 = build_coinbase_2(DEFAULT_PAYOUT_ADDRESS, coinbase_value)
+        placeholder_found = False
 
         transactions = gbt.get('transactions', [])
         coinbase_tx_hex = coinb1 + (EXTRANONCE_PLACEHOLDER if placeholder_found else '') + coinb2
@@ -546,6 +554,10 @@ class StratumMinerHandler(threading.Thread):
         self.subscribed = False
         self.authorized = False
         self.worker_name = "unknown"
+        
+        self.difficulty = 1
+        self.version_rolling = False
+        self.version_rolling_mask = "1fffe000"
 
         # assign an extranonce1 for ASIC miner, miner will caculate the double hash of 'coinb1 + extranonce1 + extranonce1 + coinb2'
         self.extranonce1 = os.urandom(EXTRANONCE1_BYTES).hex()
@@ -553,21 +565,18 @@ class StratumMinerHandler(threading.Thread):
 
         # assign the job id (string)
         self.current_job_id: Optional[str] = None
-
+        
+        # use fifo to put and get the sumbit data of ASIC miner
+        self.submit_queue = Queue(maxsize=1000)
+        self.start_submit_worker()  # Start the submit processing thread
+        
         # socket read buffer
         self._buffer = ""
         self.conn.settimeout(30)
+        
         # register
         with _miners_lock:
-            if len(_miners) >= MAX_MINERS:
-                log("ASIC Maximum number of connections reached, connection rejected.", addr)
-                try:
-                    conn.close()
-                    self.running = False
-                except:
-                    pass
-            else:
-                _miners.append(self)
+            _miners.append(self)
 
     def run(self):
         log("Miner IP ", self.addr)
@@ -606,6 +615,15 @@ class StratumMinerHandler(threading.Thread):
 
     def close(self):
         self.running = False
+        
+        # clear queue
+        while not self.submit_queue.empty():
+            try:
+                self.submit_queue.get_nowait()
+                self.submit_queue.task_done()
+            except:
+                break
+            
         try:
             with _miners_lock:
                 if self in _miners:
@@ -647,16 +665,53 @@ class StratumMinerHandler(threading.Thread):
         self.subscribed = True
         self.send_json(resp)
         
-    def send_configure_response(self, req_id):
-        resp = {
+    def send_set_difficulty(self, difficulty):
+        self.difficulty = difficulty
+
+        self.send_json({
+            "id": None,
+            "method": "mining.set_difficulty",
+            "params": [difficulty]
+        })
+        
+    def send_set_extranonce(self):
+        self.send_json({
+            "id": None,
+            "method": "mining.set_extranonce",
+            "params": [
+                self.extranonce1,
+                self.extranonce2_size
+            ]
+        })
+        
+    def send_configure_response(self, req_id, params):
+        extensions = []
+        options = {}
+
+        if len(params) >= 1:
+            extensions = params[0]
+
+        if len(params) >= 2:
+            options = params[1]
+
+        result = {}
+
+        if "version-rolling" in extensions:
+            self.version_rolling = True
+
+            requested_mask = options.get(
+                "version-rolling.mask",
+                self.version_rolling_mask
+            )
+
+            result["version-rolling"] = True
+            result["version-rolling.mask"] = requested_mask
+
+        self.send_json({
             "id": req_id,
-            "result": {
-                "version-rolling": True,
-                "version-rolling.mask": "1fffe000"
-            },
+            "result": result,
             "error": None
-        }
-        self.send_json(resp)
+        })
 
     def send_authorize_response(self, req_id, ok=True):
         resp = {"id": req_id, "result": ok, "error": None}
@@ -734,7 +789,7 @@ class StratumMinerHandler(threading.Thread):
 
     def submit_worker(self):
         while True:
-            item = self.submit_queue.get()
+            item = self.submit_queue.get()  # if no data put into self.submit_queue, thread flow will block in here
 
             try:
                 self.handle_submit(*item)
@@ -756,7 +811,11 @@ class StratumMinerHandler(threading.Thread):
             # A simple implementation would be to return true directly.
             self.send_json({"id": req_id, "result": True, "error": None})
         elif method == "mining.configure":
-            self.send_configure_response(req_id)
+            self.send_configure_response(req_id, params)
+        elif method == "mining.suggest_difficulty":
+            self.send_json({"id": req_id, "result": True, "error": None})
+        elif method == "mining.multi_version":
+            self.send_json({"id": req_id, "result": True, "error": None})
         elif method == "mining.authorize":
             full_worker = params[0] if params else "unknown"
             # Address resolution: Supports user.worker, user, or address.
@@ -775,21 +834,30 @@ class StratumMinerHandler(threading.Thread):
             self.worker_name = parts[1] if len(parts) > 1 else ""
             self.send_authorize_response(req_id, ok=True)
 
+            self.send_set_difficulty(1)
+            self.send_set_extranonce()
+
             # If the current job already exists after subscription, it will be delivered immediately.
             with _gbt_lock:
                 if _current_job:
                     self.send_job(_current_job)
         elif method == "mining.submit":
-            # params: [workername, job_id, extranonce2, ntime, nonce]
+            # params: [workername, job_id, extranonce2, ntime, nonce] or [workername, job_id, extranonce2, ntime, nonce, version] 
             # if the elements are more than 5, how to deal with?
+            worker = params[0]
+            job_id = params[1]
+            extranonce2 = params[2]
+            ntime_hex = params[3]
+            nonce_hex = params[4]
+            version_bits = params[5] if len(params) > 5 else None
+            
             try:
-                worker, job_id, extranonce2, ntime_hex, nonce_hex = (params + [None]*5)[:5]
-            except Exception:
-                worker, job_id, extranonce2, ntime_hex, nonce_hex = (None, None, None, None, None)
-            self.submit_queue.put(req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex)
+                self.submit_queue.put((req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex, version_bits))
+            except Exception as e:
+                log("Failed to queue submit:", e)
         else:
             # unknown meth, default return ok
-            self.send_json({"id": req_id, "result": False, "error": [20,"Unknown method",null]})
+            self.send_json({"id": req_id, "result": False, "error": [20,"Unknown method",None]})
 
     # -----------------------
     # --- 提交处理 (可能较慢) ---
@@ -964,7 +1032,17 @@ def start_stratum_server(listen_host: str, listen_port: int):
     try:
         while True:
             # for example, conn=<socket>, addr=('192.168.1.100', 40231)
-            conn, addr = sock.accept()
+            conn, addr = sock.accept()  # if don't have new TCP socket, code flow will block in here
+            
+            with _miners_lock:
+                if len(_miners) >= MAX_MINERS:
+                    log("ASIC Maximum number of connections reached, connection rejected.", addr)
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    continue
+                
             handler = StratumMinerHandler(conn, addr)
             handler.start()
     except KeyboardInterrupt:
