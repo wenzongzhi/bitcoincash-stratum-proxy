@@ -25,6 +25,7 @@ import binascii
 from hashlib import sha256
 import requests
 from typing import List, Dict, Any, Optional, Tuple
+from queue import Queue
 
 # ===========================
 # === 用户配置区（必须修改）===
@@ -192,21 +193,19 @@ def parse_nonce_or_ntime_to_le(hex_or_dec: Optional[str], length_bytes: int) -> 
     # 最后兜底
         return int_to_le_hex(0, length_bytes)
 
-# ==== 新增函数：规范化 nbits_be ====
+# ==== normalization nbits_be ====
 def normalize_nbits_be(bits: Any) -> str:
-    """将 bits (int or str) 转为 8 字符 hex big-endian"""
-    if isinstance(bits, int):
-        return int_to_be_hex(bits, 4)
-    s = str(bits).strip()
-    if s.startswith("0x"):
+    """Convert bits (int or str) to 8-character hex big-endian"""
+    if isinstance(bits, int):   # judge whether bits is int type
+        return int_to_be_hex(bits, 4)   # transfer bits to 4 Bytes Hex big-endian string
+    s = str(bits).strip()   # remove all space characters at both ends of the string
+    if s.startswith("0x"):  # if string start with 0x, remove the 0x
         s = s[2:]
-    # 如果全是 hex 字符
+    # if all content of bits string are hex characters
     if all(c in '0123456789abcdefABCDEF' for c in s):
-        s2 = s.rjust(8, '0')[-8:]
-        return s2.lower()
-    else:
-        # 十进制字符串
-        return int_to_be_hex(int(s), 4)
+        if len(s) != 8:
+            raise ValueError(f"Invalid bits length: {len(s)} (must be 8 characters)")
+        return s.lower()   # convert the processed string to all lowercase and return it
 
 # =====================================
 # === RPC encapsulation (with retry)===
@@ -365,17 +364,21 @@ def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         # 1) header components
-        version = int(gbt.get('version', 0))    # example, version = 536870912 (0x20000000)
-        # Stratum 通常期望大端(hex)用于显示，但 core RPC 的整数是主机整数，转换如下:
-        version_be = int_to_be_hex(version, 4)
+        version = int(gbt.get('version', 0))    # example, RPC version = 536870912, Stratum V1 format is 20000000
+        # Stratum require the big end (hex) to be used for display
+        version_be = int_to_be_hex(version, 4)  # 20000000
 
-        # previousblockhash 从 RPC 返回是常规的 hex (big-endian), Stratum mining.notify 的 prevhash 字段通常传 BE
-        prevhash_rpc = gbt.get('previousblockhash', '')
-        prevhash_be = prevhash_rpc  # 保持 RPC 返回的表示（BE）
+        # RPC previous block hash:          000000000000000000000da8aa8662f051cd0fec6eeca157eff33ea207923ec3
+        # the hash notify to ASIC miner:    07923ec3eff33ea26eeca15751cd0fecaa8662f000000da80000000000000000
+        # Convert RPC hash to Stratum V1 prevhash format
+        words = [prevhash_rpc[i:i+8] for i in range(0, 64, 8)]
+        prevhash_be = ''.join(reversed(words))
 
-        # bits: 有时是 "1a2b3c4d" 字符串，也可能是十进制，请尝试处理
-        bits = gbt.get('bits')
-        nbits_be = normalize_nbits_be(bits)  # MODIFIED
+        # bits: for example "180170da"
+        # bits = gbt.get('bits')
+        # nbits_be = normalize_nbits_be(bits) # unused function
+        bits = gbt.get('bits', '')
+        nbits_be = bits
 
         # curtime -> ntime (int -> 4 byte BE hex)
         curtime = int(gbt.get('curtime', int(time.time())))
@@ -521,51 +524,53 @@ def gbt_poller():
             time.sleep(GBT_POLL_INTERVAL)
 
 # ===========================
-# === Stratum 矿工 Handler ===
+# === Stratum Miner Handler ===
 # ===========================
 class StratumMinerHandler(threading.Thread):
     """
-    每个矿机连接一个 Handler 线程（简易 Stratum 协议）
-    支持:
+    each miner is connected to one Handler thread (Simplified Stratum Protocol).
+    support:
       - mining.subscribe / mining.extranonce.subscribe
       - mining.authorize
       - mining.submit
-      - 下发 mining.notify (基于当前 _current_job)
+      - proxy mining.notify to ASIC (base on _current_job)
     """
     def __init__(self, conn: socket.socket, addr: Tuple[str, int]):
         super().__init__(daemon=True)
+        # for example, conn=<socket>, addr=('192.168.1.100', 40231)
         self.conn = conn
         self.addr = addr
         self.running = True
 
-        # 矿工状态
+        # Miner status
         self.subscribed = False
         self.authorized = False
         self.worker_name = "unknown"
 
-        # 为每个连接分配一个 extranonce1（代理唯一标识）
+        # assign an extranonce1 for ASIC miner, miner will caculate the double hash of 'coinb1 + extranonce1 + extranonce1 + coinb2'
         self.extranonce1 = os.urandom(EXTRANONCE1_BYTES).hex()
         self.extranonce2_size = EXTRANONCE2_BYTES
 
-        # 当前分配的 job id (string)
+        # assign the job id (string)
         self.current_job_id: Optional[str] = None
 
-        # socket读buffer
+        # socket read buffer
         self._buffer = ""
         self.conn.settimeout(30)
-        # 注册
+        # register
         with _miners_lock:
             if len(_miners) >= MAX_MINERS:
-                log("已达到最大连接数，拒绝连接", addr)
+                log("ASIC Maximum number of connections reached, connection rejected.", addr)
                 try:
                     conn.close()
+                    self.running = False
                 except:
                     pass
             else:
                 _miners.append(self)
 
     def run(self):
-        log("矿机连接来自", self.addr)
+        log("Miner IP ", self.addr)
         try:
             while self.running:
                 try:
@@ -589,15 +594,15 @@ class StratumMinerHandler(threading.Thread):
                     try:
                         msg = json.loads(line)
                     except Exception as e:
-                        log("无效 JSON 来自矿机:", e)
+                        log("Invalid JSON from a miner:", e)
                         continue
                     try:
                         self.handle_message(msg)
                     except Exception as e:
-                        log("处理矿机消息异常:", e)
+                        log("Handling miner message anomalies:", e)
         finally:
             self.close()
-            log("矿机断开:", self.addr)
+            log("miner disconnected:", self.addr)
 
     def close(self):
         self.running = False
@@ -613,30 +618,44 @@ class StratumMinerHandler(threading.Thread):
             pass
 
     # -----------------------
-    # --- 发送/响应方法 ---
+    # --- send / response function---
     # -----------------------
     def send_json(self, obj: Dict[str, Any]):
-        """统一发送 JSON 消息，压缩格式 + 确保 \n"""
+        """Send JSON messages uniformly, with compressed format + ensure \n"""
         try:
-            # 压缩 JSON：去掉空格，减小体积
+            # compress JSON: remove spaces to reduce file size
             data = (json.dumps(obj, separators=(',', ':')) + '\n').encode('utf-8')
             self.conn.sendall(data)
         except Exception as e:
-            log("发送给矿机失败:", e)
+            log("Failed to send to miner:", e)
             self.close()
         
     def send_subscription_response(self, req_id):
-        # Stratum 标准: 返回 extranonce1 和 extranonce2_size
+        # Stratum standard: return extranonce1 and extranonce2_size
         resp = {
             "id": req_id,
             "result": [
-                ["mining.set_difficulty", "mining.notify"],
+                [
+                    ["mining.set_difficulty", "1"],
+                    ["mining.notify", "1"]
+                ],
                 self.extranonce1,
                 self.extranonce2_size
             ],
             "error": None
         }
         self.subscribed = True
+        self.send_json(resp)
+        
+    def send_configure_response(self, req_id):
+        resp = {
+            "id": req_id,
+            "result": {
+                "version-rolling": True,
+                "version-rolling.mask": "1fffe000"
+            },
+            "error": None
+        }
         self.send_json(resp)
 
     def send_authorize_response(self, req_id, ok=True):
@@ -706,8 +725,26 @@ class StratumMinerHandler(threading.Thread):
         self.send_json(notify)
         log(f"下发 job -> miner {self.addr}, job_id={jid}, coinb1_len={len(coinb1_filled)}, coinb2_len={len(coinb2)}")
 
+    def start_submit_worker(self):
+        t = threading.Thread(
+            target=self.submit_worker,
+            daemon=True
+        )
+        t.start()
+
+    def submit_worker(self):
+        while True:
+            item = self.submit_queue.get()
+
+            try:
+                self.handle_submit(*item)
+            except Exception as e:
+                log("submit worker error:", e)
+
+            self.submit_queue.task_done()
+            
     # -----------------------
-    # --- 消息处理入口 ---
+    # --- Proxy receive the message from ASIC miner ---
     # -----------------------
     def handle_message(self, msg: Dict[str, Any]):
         method = msg.get('method')
@@ -715,40 +752,44 @@ class StratumMinerHandler(threading.Thread):
         params = msg.get('params', [])
         if method == "mining.subscribe":
             self.send_subscription_response(req_id)
-            # 订阅完成后若已有当前 job 则立即下发
+        elif method == "mining.extranonce.subscribe":
+            # A simple implementation would be to return true directly.
+            self.send_json({"id": req_id, "result": True, "error": None})
+        elif method == "mining.configure":
+            self.send_configure_response(req_id)
+        elif method == "mining.authorize":
+            full_worker = params[0] if params else "unknown"
+            # Address resolution: Supports user.worker, user, or address.
+            parts = full_worker.split('.')
+            address = parts[0]
+            if not address.startswith('bitcoincash:'):
+            # Try adding a prefix (BCH addresses usually start with q or p).
+                if address.startswith('q') or address.startswith('p'):
+                    address = 'bitcoincash:' + address  # cash address
+                elif address.startswith('1') or address.startswith('3'):
+                    address = address   # legacy address
+                else:
+                    address = DEFAULT_PAYOUT_ADDRESS  # If ASIC miner use wrong address format, proxy will use default address
+                    
+            self.payout_address = address
+            self.worker_name = parts[1] if len(parts) > 1 else ""
+            self.send_authorize_response(req_id, ok=True)
+
+            # If the current job already exists after subscription, it will be delivered immediately.
             with _gbt_lock:
                 if _current_job:
                     self.send_job(_current_job)
-        elif method == "mining.extranonce.subscribe":
-            # 简易实现，直接返回 true
-            self.send_json({"id": req_id, "result": True, "error": None})
-        elif method == "mining.authorize":
-            full_worker = params[0] if params else "unknown"
-            # 解析地址：支持 user.worker 或 user 或 address
-            parts = full_worker.split('.')
-            address = parts[-1] if len(parts) > 1 else parts[0]
-            if not address.startswith('bitcoincash:'):
-            # 尝试补充前缀（BCH 地址通常以 q 或 p 开头）
-                if address.startswith('q') or address.startswith('p'):
-                    address = 'bitcoincash:' + address
-                else:
-                    address = DEFAULT_PAYOUT_ADDRESS  # fallback
-                    
-            self.payout_address = address
-            self.worker_name = full_worker
-            self.send_authorize_response(req_id, ok=True)
-            #self.authorized = True  # 必须设置
         elif method == "mining.submit":
             # params: [workername, job_id, extranonce2, ntime, nonce]
-            # 也可能包含额外字段（取前5个）
+            # if the elements are more than 5, how to deal with?
             try:
                 worker, job_id, extranonce2, ntime_hex, nonce_hex = (params + [None]*5)[:5]
             except Exception:
                 worker, job_id, extranonce2, ntime_hex, nonce_hex = (None, None, None, None, None)
-            threading.Thread(target=self.handle_submit, args=(req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex), daemon=True).start()
+            self.submit_queue.put(req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex)
         else:
-            # 未知方法，返回默认 ok
-            self.send_json({"id": req_id, "result": None, "error": None})
+            # unknown meth, default return ok
+            self.send_json({"id": req_id, "result": False, "error": [20,"Unknown method",null]})
 
     # -----------------------
     # --- 提交处理 (可能较慢) ---
@@ -912,21 +953,22 @@ def _build_merkle_root_be(leaves_be: List[bytes]) -> bytes:
     return hashes[0]
     
 # ===========================
-# === Stratum 主服务循环 ===
+# === Stratum Main service loop ===
 # ===========================
 def start_stratum_server(listen_host: str, listen_port: int):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((listen_host, listen_port))
     sock.listen(100)
-    log(f"Stratum 代理监听 {listen_host}:{listen_port}")
+    log(f"Stratum proxy listen {listen_host}:{listen_port}")
     try:
         while True:
+            # for example, conn=<socket>, addr=('192.168.1.100', 40231)
             conn, addr = sock.accept()
             handler = StratumMinerHandler(conn, addr)
             handler.start()
     except KeyboardInterrupt:
-        log("收到退出信号，关闭服务器")
+        log("received the exit signal, shut down the server.")
     finally:
         try:
             sock.close()
