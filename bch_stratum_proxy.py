@@ -49,6 +49,7 @@ EXTRANONCE2_BYTES = 4
 # 如果 coinbasetxn 中没有明确的占位符，我们会在 coinbase 末尾追加 extranonces
 # （多数 BCH GBT 会包含 coinbasetxn.data，并且会包含占位符）
 EXTRANONCE_PLACEHOLDER = "00" * (EXTRANONCE1_BYTES + EXTRANONCE2_BYTES)
+COINBASE_TAG = b"/BitcoinCash Stratum Proxy/"
 
 # 默认支付地址（当矿工未提供时使用）
 DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
@@ -238,18 +239,30 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
 # ===========================
 # === GBT -> Job Conversion and Broadcast ===
 # ===========================
-def _encode_height_to_coinbase(height: int) -> str: # here need to do some optimized
-    hb = b''
-    n = height
-    while True:
-        hb += bytes([n & 0xff])
-        n >>= 8
-        if n == 0:
-            break
-    return bytes_to_hex(bytes([len(hb)])) + bytes_to_hex(hb)
+def _encode_height_to_coinbase(height: int) -> str:
+    """Encode the BIP34 block-height push used at the start of scriptSig."""
+    if height < 0:
+        raise ValueError("block height must be non-negative")
+
+    if height == 0:
+        encoded = b""
+    else:
+        encoded_bytes = bytearray()
+        value = height
+        while value:
+            encoded_bytes.append(value & 0xff)
+            value >>= 8
+        if encoded_bytes[-1] & 0x80:
+            encoded_bytes.append(0)
+        encoded = bytes(encoded_bytes)
+
+    if len(encoded) > 75:
+        raise ValueError("block height encoding is unexpectedly large")
+    return bytes([len(encoded)]).hex() + encoded.hex()
 
 def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
     # A minimal coinbase tx, used only in the extreme case where the node does not return coinbasetxn.data.
+    # this is unused function, just for reference
     version = "01000000"
     tx_in_count = "01"
     prev_out = "00" * 32 + "ffffffff"
@@ -263,61 +276,86 @@ def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
     lock_time = "00000000"
     return version + tx_in_count + prev_out + script_len + script_hex + seq + tx_out_count + value + pk_script_len + pk_script + lock_time
 
-def build_coinbase_1(height: int) -> str:
+def build_coinbase_1(height: int, coinbase_aux: Optional[Dict[str, Any]] = None) -> str:
     """
-    Manually construct coinbase transaction
+    Build the transaction prefix before extranonce1/extranonce2.
+
+    The miner constructs the full transaction as:
+    coinb1 + extranonce1 + extranonce2 + coinb2.
+    01000000                     version
+    01                           input_count
+    00...00ffffffff              null_prevout fixed by 32 bytes "00" txid + 4 bytes "ffffffff" vout 
+    size of coinbase script      include script length and extranonce1 + extranonce2 size
+    script_prefix                height_push + COINBASE_TAG
     """
-    print("need to do")
-    '''
-    # 1. version
-    version = "02000000" # need to change?
+    height_push = bytes.fromhex(_encode_height_to_coinbase(height))
+    aux_data = b""
+    for value in (coinbase_aux or {}).values():
+        if value:
+            aux_data += bytes.fromhex(str(value))
 
-    # 2. input count
-    in_count = "01"
+    script_prefix = height_push + aux_data + COINBASE_TAG
+    extranonce_size = EXTRANONCE1_BYTES + EXTRANONCE2_BYTES
+    script_sig_size = len(script_prefix) + extranonce_size
+    if not 2 <= script_sig_size <= 100:
+        raise ValueError(
+            f"coinbase scriptSig size {script_sig_size} is outside consensus limits"
+        )
 
-    # 3. prevout
-    prevout_hash = "0" * 64
-    prevout_index = "ffffffff"
+    version = int_to_le_hex(2, 4)
+    input_count = varint_encode(1)
+    null_prevout = ("00" * 32) + "ffffffff"
+    script_length = varint_encode(script_sig_size)
+    return version + input_count + null_prevout + script_length + script_prefix.hex()
 
-    # 4. coinbase script: height + extranonce placeholder + aux
-    height_script = _encode_height_to_coinbase(height)
-    coinbase_script = height_script + extranonce_placeholder
-    script_len = varint_encode(len(hex_to_bytes(coinbase_script)))
+def _address_to_script_pubkey(payout_address: str) -> str:
+    """
+    P2PKH
+    - 76a914
+    - <20-byte hash160>
+    - 88ac
+    
+    P2SH
+    - a914
+    - <20-byte script hash>
+    - 87
+    """
+    legacy = convert.to_legacy_address(payout_address)  # change payout address to start with 1 or 3
+    decoded = base58.b58decode_check(legacy)
+    if len(decoded) != 21:
+        raise ValueError("payout address payload must contain a 20-byte hash")
 
-    # 5. sequence
-    sequence = "ffffffff"
+    version = decoded[0]
+    payload_hex = decoded[1:].hex()
+    if version in (0x00, 0x6f):
+        return "76a914" + payload_hex + "88ac"
+    if version in (0x05, 0xc4):
+        return "a914" + payload_hex + "87"
+    raise ValueError(f"unsupported legacy address version 0x{version:02x}")
 
-    # 6. output count
-    out_count = "01"
-
-    # 7. value (satoshi)
-    value_hex = int_to_le_hex(coinbase_value, 8)
-
-    # 8. scriptPubKey: P2PKH for BCH address
-    try:
-        legacy = convert.to_legacy_address(payout_address)
-        # base58 解码 legacy 地址
-        decoded = base58.b58decode(legacy)
-        pubkey_hash = bytes_to_hex(decoded[1:-4])  # 去掉 version + checksum
-        script = "76a914" + pubkey_hash + "88ac"
-    except Exception as e:
-        log("地址解析失败，使用默认 P2PKH:", e)
-        script = "76a914000000000000000000000000000000000000000088ac"
-
-    script_len_out = varint_encode(len(hex_to_bytes(script)))
-
-    # 9. locktime
-    locktime = "00000000"
-
-    return (
-        version + in_count + prevout_hash + prevout_index +
-        script_len + coinbase_script + sequence +
-        out_count + value_hex + script_len_out + script + locktime
-    )
-    '''
 
 def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
-    print("need to do")
+    """
+    Build the transaction suffix after extranonce1/extranonce2.
+    ffffffff            sequence, fixed value
+    01                  output_count
+    1a6d291200000000    block reward
+    script_pubkey
+    00000000            lock_time, no lock fixed at 00000000
+    """
+    if not 0 < coinbase_value <= 0xffffffffffffffff:
+        raise ValueError("coinbase value must be a positive uint64")
+
+    script_pubkey = _address_to_script_pubkey(payout_address)
+    sequence = "ffffffff"
+    output_count = varint_encode(1)
+    output = (
+        int_to_le_hex(coinbase_value, 8)
+        + varint_encode(len(bytes.fromhex(script_pubkey)))
+        + script_pubkey
+    )
+    lock_time = "00000000"
+    return sequence + output_count + output + lock_time
     
 # 计算从 coinbase 到 root 的路径
 def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -> List[str]:
@@ -370,7 +408,7 @@ def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -
     
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
-        # 1) header components
+        # 1) header components, version
         version = int(gbt.get('version', 0))    # example, RPC version = 536870912, Stratum V1 format is 20000000
         # Stratum require the big end (hex) to be used for display
         version_be = int_to_be_hex(version, 4)  # 20000000
@@ -378,6 +416,9 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # RPC previous block hash:          000000000000000000000da8aa8662f051cd0fec6eeca157eff33ea207923ec3
         # the hash notify to ASIC miner:    07923ec3eff33ea26eeca15751cd0fecaa8662f000000da80000000000000000
         # Convert RPC hash to Stratum V1 prevhash format
+        prevhash_rpc = str(gbt.get('previousblockhash', ''))
+        if len(prevhash_rpc) != 64:
+            raise ValueError("GBT previousblockhash must be 32 bytes")
         words = [prevhash_rpc[i:i+8] for i in range(0, 64, 8)]
         prevhash_be = ''.join(reversed(words))
 
@@ -392,41 +433,22 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ntime_be = int_to_be_hex(curtime, 4)
 
         # 2) coinbase deal: Bitcoin can use coinbasetxn.data, Bitcoincash doesn't support coinbasetxn.data 
-
+        # the bitcoin coinbase will be developed in feature
         coinb1 = ''
         coinb2 = ''
-        '''
-        placeholder_found = False  # MODIFIED
 
-        coinbasetxn = gbt.get('coinbasetxn')
-        if coinbasetxn and isinstance(coinbasetxn, dict) and 'data' in coinbasetxn:
-            coinbase_hex = coinbasetxn['data']  # 这是 raw tx hex 模板，通常包含 extranonce 占位
-            # 尝试在 coinbase_hex 中定位占位符（连续全零）
-            if EXTRANONCE_PLACEHOLDER and EXTRANONCE_PLACEHOLDER in coinbase_hex:
-                parts = coinbase_hex.split(EXTRANONCE_PLACEHOLDER, 1)
-                coinb1 = parts[0]
-                coinb2 = parts[1]
-                placeholder_found = True
-            else:
-                # 占位符未找到：我们采取简易方式 —— 将 coinbase_template 放在 coinb1，coinb2 为空
-                # 然后在真实提交时将 extranonce1+extranonce2 追加到 coinb1 的末尾
-                coinb1 = coinbase_hex
-                coinb2 = ''
-                placeholder_found = False
-        else:
-        '''
-        # no coinbasetxn, manually creat
+        # there is no coinbasetxn in bitcoincash blocktemplate, coinbase should be manually created by proxy
         height = gbt.get('height')
         coinbase_value = gbt.get('coinbasevalue', 0)
         if height is None or coinbase_value == 0:
             return None
         # 使用默认地址或配置地址
-        coinb1 = build_coinbase_1(height)
+        coinb1 = build_coinbase_1(height, gbt.get('coinbaseaux'))
         coinb2 = build_coinbase_2(DEFAULT_PAYOUT_ADDRESS, coinbase_value)
         placeholder_found = False
 
         transactions = gbt.get('transactions', [])
-        coinbase_tx_hex = coinb1 + (EXTRANONCE_PLACEHOLDER if placeholder_found else '') + coinb2
+        coinbase_tx_hex = coinb1 + EXTRANONCE_PLACEHOLDER + coinb2
         coinbase_hash_be = dsha256(hex_to_bytes(coinbase_tx_hex))
 
         tx_hashes_be: List[bytes] = []
@@ -862,7 +884,16 @@ class StratumMinerHandler(threading.Thread):
     # -----------------------
     # --- 提交处理 (可能较慢) ---
     # -----------------------
-    def handle_submit(self, req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex):
+    def handle_submit(
+        self,
+        req_id,
+        worker,
+        job_id,
+        extranonce2,
+        ntime_hex,
+        nonce_hex,
+        version_bits=None,
+    ):
         """
         1. 验证 job_id
         2. 拼接 extranonce（不重构 coinbase）
