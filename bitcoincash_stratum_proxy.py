@@ -320,7 +320,21 @@ def _address_to_script_pubkey(payout_address: str) -> str:
     - <20-byte script hash>
     - 87
     """
-    legacy = convert.to_legacy_address(payout_address)  # change payout address to start with 1 or 3
+    address = payout_address.strip()
+    if not address:
+        raise ValueError("payout address must not be empty")
+
+    # ecashaddress requires a CashAddr prefix. Mining software commonly sends
+    # the payload only, so add the BCH prefix before decoding it.
+    if ':' not in address and address[0].lower() in ('q', 'p'):
+        prefix = 'BITCOINCASH:' if address.isupper() else 'bitcoincash:'
+        address = prefix + address
+
+    try:
+        legacy = convert.to_legacy_address(address)
+    except Exception as e:
+        raise ValueError(f"invalid Bitcoin Cash payout address: {payout_address}") from e
+
     decoded = base58.b58decode_check(legacy)
     if len(decoded) != 21:
         raise ValueError("payout address payload must contain a 20-byte hash")
@@ -332,6 +346,13 @@ def _address_to_script_pubkey(payout_address: str) -> str:
     if version in (0x05, 0xc4):
         return "a914" + payload_hex + "87"
     raise ValueError(f"unsupported legacy address version 0x{version:02x}")
+
+
+def _validated_payout_address(payout_address: str) -> str:
+    """Return a trimmed usable address, raising ValueError when it is invalid."""
+    address = payout_address.strip()
+    _address_to_script_pubkey(address)
+    return address
 
 
 def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
@@ -477,6 +498,7 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "ntime_be": ntime_be,
             "coinb1": coinb1,
             "coinb2": coinb2,
+            "coinbase_value": coinbase_value,
             "merkle_branch": merkle_branch,
             "extranonce1": extranonce1,
             "extranonce2_size": extranonce2_size,
@@ -576,6 +598,8 @@ class StratumMinerHandler(threading.Thread):
         self.subscribed = False
         self.authorized = False
         self.worker_name = "unknown"
+        self.payout_address = DEFAULT_PAYOUT_ADDRESS
+        self.current_coinb2: Optional[str] = None
         
         self.difficulty = 1
         self.version_rolling = False
@@ -762,7 +786,17 @@ class StratumMinerHandler(threading.Thread):
         
         # 生成每个矿机专属 coinb1（包含矿机的 extranonce1）
         coinb1 = job.get('coinb1', '')
-        coinb2 = job.get('coinb2', '')
+        coinbase_value = int(job.get('coinbase_value', 0))
+        try:
+            coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
+        except ValueError as e:
+            log(
+                f"Miner {self.addr} payout address is unusable, "
+                f"falling back to default address: {e}"
+            )
+            self.payout_address = _validated_payout_address(DEFAULT_PAYOUT_ADDRESS)
+            coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
+        self.current_coinb2 = coinb2
 
         # 如果 coinb1 中包含占位符 (EXTRANONCE_PLACEHOLDER)，则替换为代理extranonce1（job-level或conn-level）
         placeholder = EXTRANONCE_PLACEHOLDER
@@ -841,17 +875,17 @@ class StratumMinerHandler(threading.Thread):
         elif method == "mining.authorize":
             full_worker = params[0] if params else "unknown"
             # Address resolution: Supports user.worker, user, or address.
-            parts = full_worker.split('.')
-            address = parts[0]
-            if not address.startswith('bitcoincash:'):
-            # Try adding a prefix (BCH addresses usually start with q or p).
-                if address.startswith('q') or address.startswith('p'):
-                    address = 'bitcoincash:' + address  # cash address
-                elif address.startswith('1') or address.startswith('3'):
-                    address = address   # legacy address
-                else:
-                    address = DEFAULT_PAYOUT_ADDRESS  # If ASIC miner use wrong address format, proxy will use default address
-                    
+            parts = str(full_worker).split('.', 1)
+            submitted_address = parts[0]
+            try:
+                address = _validated_payout_address(submitted_address)
+            except ValueError as e:
+                log(
+                    f"Miner {self.addr} submitted invalid payout address "
+                    f"{submitted_address!r}; using default address: {e}"
+                )
+                address = _validated_payout_address(DEFAULT_PAYOUT_ADDRESS)
+
             self.payout_address = address
             self.worker_name = parts[1] if len(parts) > 1 else ""
             self.send_authorize_response(req_id, ok=True)
@@ -912,7 +946,12 @@ class StratumMinerHandler(threading.Thread):
 
             # ---------- 1. coinbase ----------
             coinb1 = job.get('coinb1', '')
-            coinb2 = job.get('coinb2', '')
+            coinb2 = self.current_coinb2
+            if not coinb2:
+                coinb2 = build_coinbase_2(
+                    self.payout_address,
+                    int(job.get('coinbase_value', 0)),
+                )
             ex2 = (extranonce2 or '').rjust(self.extranonce2_size*2, '0')[:self.extranonce2_size*2]
 
             if job.get('placeholder_found', False) and EXTRANONCE_PLACEHOLDER in coinb1:
