@@ -46,9 +46,6 @@ EXTRANONCE1_BYTES = 4
 # 矿机会提供的 extranonce2 大小（默认使用 4）
 EXTRANONCE2_BYTES = 4
 
-# 如果 coinbasetxn 中没有明确的占位符，我们会在 coinbase 末尾追加 extranonces
-# （多数 BCH GBT 会包含 coinbasetxn.data，并且会包含占位符）
-EXTRANONCE_PLACEHOLDER = "00" * (EXTRANONCE1_BYTES + EXTRANONCE2_BYTES)
 COINBASE_TAG = b"/BitcoinCash Stratum Proxy/"
 
 # 默认支付地址（当矿工未提供时使用）
@@ -394,55 +391,56 @@ def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
     lock_time = "00000000"
     return sequence + output_count + output + lock_time
     
-# 计算从 coinbase 到 root 的路径
-def _compute_merkle_branch(coinbase_hash_be: bytes, tx_hashes_be: List[bytes]) -> List[str]:
+def _compute_merkle_branch(tx_hashes_be: List[bytes]) -> List[str]:
     """
-    计算从 coinbase 到 merkle root 的路径（不包含 coinbase 本身）
-    返回 BE hex 字符串列表
-    
-    hashes = [coinbase_hash_be] + tx_hashes_be
-    branch = []
-    i = 0  # coinbase index
-    while len(hashes) > 1:
-        if i % 2 == 1:
-            left = hashes[i - 1]
-            right = hashes[i]
-        else:
-            left = hashes[i]
-            right = hashes[i + 1] if i + 1 < len(hashes) else hashes[i]
-        combined = left + right
-        parent = dsha256(combined)
-        branch.append(bytes_to_hex(right if i % 2 == 0 else left))
-        # 更新 hashes
-        new_hashes = []
-        for j in range(0, len(hashes), 2):
-            l = hashes[j]
-            r = hashes[j + 1] if j + 1 < len(hashes) else l
-            new_hashes.append(dsha256(l + r))
-        hashes = new_hashes
-        # 更新 i
-        i = i // 2
-    return branch
+    Build the sibling path for the coinbase leaf at index zero.
+
+    None represents the subtree containing the coinbase. The returned branch
+    therefore depends only on non-coinbase transactions.
     """
-    hashes = [coinbase_hash_be] + tx_hashes_be
+    nodes: List[Optional[bytes]] = [None] + tx_hashes_be
     branch: List[str] = []
-    index = 0  # coinbase index 0
-    while len(hashes) > 1:
-        if index % 2 == 1:
-            sibling = hashes[index - 1]
-        else:
-            sibling = hashes[index + 1] if index + 1 < len(hashes) else hashes[index]
+
+    while len(nodes) > 1:
+        sibling = nodes[1]
+        if sibling is None:
+            raise ValueError("coinbase merkle sibling must not be empty")
         branch.append(bytes_to_hex(sibling))
-        # 构建下一层
-        new_hashes: List[bytes] = []
-        for j in range(0, len(hashes), 2):
-            l = hashes[j]
-            r = hashes[j + 1] if j + 1 < len(hashes) else hashes[j]
-            new_hashes.append(dsha256(l + r))
-        hashes = new_hashes
-        index = index // 2
+
+        next_nodes: List[Optional[bytes]] = []
+        for index in range(0, len(nodes), 2):
+            left = nodes[index]
+            right = nodes[index + 1] if index + 1 < len(nodes) else left
+            if left is None or right is None:
+                next_nodes.append(None)
+            else:
+                next_nodes.append(dsha256(left + right))
+        nodes = next_nodes
+
     return branch
-    
+
+
+def _get_template_tx_hashes(transactions: List[Dict[str, Any]]) -> List[bytes]:
+    """
+    Return transaction hashes in the internal byte order used by the Merkle tree.
+
+    BCHN has already calculated and validated these transaction IDs. The proxy
+    only decodes them; it does not hash every raw transaction again.
+    """
+    hashes: List[bytes] = []
+    for index, tx in enumerate(transactions):
+        txid = tx.get('txid') or tx.get('hash')
+        if not isinstance(txid, str) or len(txid) != 64:
+            raise ValueError(f"GBT transaction {index} has no valid txid/hash")
+        try:
+            hashes.append(reverse_bytes(hex_to_bytes(txid)))
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(
+                f"GBT transaction {index} contains an invalid txid/hash"
+            ) from e
+    return hashes
+
+
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         # 1) header components, version
@@ -471,37 +469,15 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
         # 2) coinbase deal: Bitcoin can use coinbasetxn.data, Bitcoincash doesn't support coinbasetxn.data 
         # the bitcoin coinbase will be developed in feature
-        coinb1 = ''
-        coinb2 = ''
-
         # there is no coinbasetxn in bitcoincash blocktemplate, coinbase should be manually created by proxy
         height = gbt.get('height')
         coinbase_value = gbt.get('coinbasevalue', 0)
         if height is None or coinbase_value == 0:
             return None
-        # 使用默认地址或配置地址
         coinb1 = build_coinbase_1(height, gbt.get('coinbaseaux'))
-        coinb2 = build_coinbase_2(DEFAULT_PAYOUT_ADDRESS, coinbase_value)
-        placeholder_found = False
-
         transactions = gbt.get('transactions', [])
-        coinbase_tx_hex = coinb1 + EXTRANONCE_PLACEHOLDER + coinb2
-        coinbase_hash_be = dsha256(hex_to_bytes(coinbase_tx_hex))
-
-        tx_hashes_be: List[bytes] = []
-        for tx in transactions:
-            if tx.get('data'):
-                # 使用 raw tx data 计算内部 node bytes（保持与 coinbase 同样的内部表示）
-                tx_hashes_be.append(dsha256(hex_to_bytes(tx['data'])))
-            elif tx.get('hash'):
-                # RPC 提供的 hash/txid 是 BE hex —— 将其反转为内部 bytes 表示
-                tx_hashes_be.append(reverse_bytes(hex_to_bytes(tx['hash'])))  # FIXED
-        merkle_branch = _compute_merkle_branch(coinbase_hash_be, tx_hashes_be)
-
-        # 4) extranonce1 由代理生成并写入job（每个矿机仍会覆盖自己的extranonce1）
-        # 这里生成一个 job-level extranonce1，以确保coinbase模板能包含至少一个代理extranonce1占位
-        extranonce1 = os.urandom(EXTRANONCE1_BYTES).hex()
-        extranonce2_size = EXTRANONCE2_BYTES
+        tx_hashes_be = _get_template_tx_hashes(transactions)
+        merkle_branch = _compute_merkle_branch(tx_hashes_be)
 
         job_id = f"{int(time.time())}_{prevhash_be[-8:]}"
 
@@ -513,12 +489,8 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "nbits_be": nbits_be,
             "ntime_be": ntime_be,
             "coinb1": coinb1,
-            "coinb2": coinb2,
             "coinbase_value": coinbase_value,
             "merkle_branch": merkle_branch,
-            "extranonce1": extranonce1,
-            "extranonce2_size": extranonce2_size,
-            "placeholder_found": placeholder_found,  # MODIFIED
         }
         return job
     except Exception as e:
@@ -530,6 +502,8 @@ def broadcast_job_to_miners(job: Dict[str, Any]):
     with _miners_lock:
         miners_copy = list(_miners)
     for m in miners_copy:
+        if not m.subscribed or not m.authorized:
+            continue
         try:
             m.send_job(job)
         except Exception as e:
@@ -619,7 +593,7 @@ class StratumMinerHandler(threading.Thread):
         self.version_rolling = False
         self.version_rolling_mask = "1fffe000"
 
-        # assign an extranonce1 for ASIC miner, miner will caculate the double hash of 'coinb1 + extranonce1 + extranonce1 + coinb2'
+        # Each miner connection gets a stable proxy-assigned extranonce1.
         self.extranonce1 = os.urandom(EXTRANONCE1_BYTES).hex()
         self.extranonce2_size = EXTRANONCE2_BYTES
 
@@ -781,12 +755,11 @@ class StratumMinerHandler(threading.Thread):
 
     def send_job(self, job: Dict[str, Any]):
         """
-        将 job 发送给矿机 (mining.notify)
-        Stratum mining.notify 参数 (简化)：
+        send the job to ASIC miners (mining.notify)
+        Stratum mining.notify
         [job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]
-        注意：不同矿机固件对 coinb1/coinb2 解析敏感，下面采取较保守的处理：
-          - 若 job 中 coinb1/coinb2 是模板（包含占位符），将把代理的 extranonce1 插入 coinb1
-          - 若 coinb1 是完整 coinbase（无占位符），则 coinb1 保持原样，coinb2 为空
+        The miner constructs:
+        coinb1 + connection extranonce1 + miner extranonce2 + coinb2.
         """
         if not job:
             return
@@ -798,7 +771,7 @@ class StratumMinerHandler(threading.Thread):
         # 延迟 50ms 避免粘包
         time.sleep(0.05)
         
-        # 生成每个矿机专属 coinb1（包含矿机的 extranonce1）
+        # coinb2 is specific to this miner's validated payout address.
         coinb1 = job.get('coinb1', '')
         coinbase_value = int(job.get('coinbase_value', 0))
         try:
@@ -812,18 +785,11 @@ class StratumMinerHandler(threading.Thread):
             coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
         self.current_coinb2 = coinb2
 
-        # 如果 coinb1 中包含占位符 (EXTRANONCE_PLACEHOLDER)，则替换为代理extranonce1（job-level或conn-level）
-        placeholder = EXTRANONCE_PLACEHOLDER
         extranonce2_placeholder = '00' * self.extranonce2_size
 
-        # 确保 miner 收到的 coinb1 中包含 extranonce1 的位置
-        if placeholder and job.get('placeholder_found', False) and placeholder in coinb1:
-            coinb1_filled = coinb1.replace(placeholder, self.extranonce1 + extranonce2_placeholder, 1)
-        else:
-            # 无占位符：coinb1 已完整，不要追加 extranonce1
-            coinb1_filled = coinb1
-
-        full_coinb_hex = coinb1_filled + coinb2
+        full_coinb_hex = (
+            coinb1 + self.extranonce1 + extranonce2_placeholder + coinb2
+        )
         # 长度校验
         if len(full_coinb_hex) < 100 or len(full_coinb_hex) > 5000:
             log(f"警告: 下发 coinbase 长度异常 len={len(full_coinb_hex)} job_id={job.get('job_id')}")
@@ -838,7 +804,7 @@ class StratumMinerHandler(threading.Thread):
         params = [
             jid,
             job.get('prevhash_be'),
-            coinb1_filled,
+            coinb1,
             coinb2 or "",
             branch,  # 已截断的安全 branch
             job.get('version_be'),
@@ -848,7 +814,7 @@ class StratumMinerHandler(threading.Thread):
         ]
         notify = {"id": None, "method": "mining.notify", "params": params}
         self.send_json(notify)
-        log(f"下发 job -> miner {self.addr}, job_id={jid}, coinb1_len={len(coinb1_filled)}, coinb2_len={len(coinb2)}")
+        log(f"peoxy send job -> miner {self.addr}, job_id={jid}, coinb1_len={len(coinb1)}, coinb2_len={len(coinb2)}")
 
     def start_submit_worker(self):
         t = threading.Thread(
@@ -968,39 +934,14 @@ class StratumMinerHandler(threading.Thread):
                 )
             ex2 = (extranonce2 or '').rjust(self.extranonce2_size*2, '0')[:self.extranonce2_size*2]
 
-            if job.get('placeholder_found', False) and EXTRANONCE_PLACEHOLDER in coinb1:
-                coinbase_hex = coinb1.replace(EXTRANONCE_PLACEHOLDER, self.extranonce1 + ex2, 1) + coinb2
-            else:
-                #coinbase_hex = coinb1 + ex2  # 只加 ex2，不要加 extranonce1！
-                coinbase_hex = coinbase_hex = coinb1 + self.extranonce1 + ex2 + coinb2
+            coinbase_hex = coinb1 + self.extranonce1 + ex2 + coinb2
 
             # ---------- 2. merkle ----------
-            """
-            leaves_be = [dsha256(hex_to_bytes(coinbase_hex))]
-            for tx in gbt.get('transactions', []):
-                h = tx.get('hash') or tx.get('txid')
-                if h:
-                    leaves_be.append(hex_to_bytes(h))
-            """
-            leaves_be: List[bytes]  = [dsha256(hex_to_bytes(coinbase_hex))]
-            for tx in gbt.get('transactions', []):
-                if tx.get('data'):
-                    leaves_be.append(dsha256(hex_to_bytes(tx['data'])))
-                elif tx.get('hash'):
-                    # RPC hash is BE hex -> convert to internal bytes by reversing
-                    leaves_be.append(reverse_bytes(hex_to_bytes(tx['hash'])))  # FIXED
-            merkle_root_be = _build_merkle_root_be(leaves_be)
-
-            # 用 branch 验证 merkle root 一致性
-            try:
-                # 构造 merkle root from branch
-                h = dsha256(hex_to_bytes(coinbase_hex))
-                for mh in job.get('merkle_branch', []):
-                    h = dsha256(h + hex_to_bytes(mh))
-                if h != merkle_root_be:
-                    log("警告: merkle_branch 计算与 build_merkle_root_be 不一致", worker, job_id)
-            except Exception as e:
-                log("merkle 分支校验异常:", e)
+            merkle_root_be = dsha256(hex_to_bytes(coinbase_hex))
+            for sibling_hex in job.get('merkle_branch', []):
+                merkle_root_be = dsha256(
+                    merkle_root_be + hex_to_bytes(sibling_hex)
+                )
             #version_le = int_to_le_hex(gbt.get('version', 0), 4)
             version_le = reverse_hex(job['version_be'])
             prevhash_le    = reverse_hex(job.get('prevhash_be'))  # BE hex → LE hex
