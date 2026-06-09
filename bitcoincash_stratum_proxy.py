@@ -320,32 +320,48 @@ def _address_to_script_pubkey(payout_address: str) -> str:
     - <20-byte script hash>
     - 87
     """
+    if not isinstance(payout_address, str):
+        raise ValueError("payout address must be a string")
+
     address = payout_address.strip()
     if not address:
         raise ValueError("payout address must not be empty")
 
-    # ecashaddress requires a CashAddr prefix. Mining software commonly sends
-    # the payload only, so add the BCH prefix before decoding it.
-    if ':' not in address and address[0].lower() in ('q', 'p'):
-        prefix = 'BITCOINCASH:' if address.isupper() else 'bitcoincash:'
-        address = prefix + address
+    # CashAddr is case-insensitive only when the whole address uses one case.
+    # Normalize it because mining software commonly omits "bitcoincash:".
+    if ':' in address or address[0].lower() in ('q', 'p'):
+        if address.lower() != address and address.upper() != address:
+            raise ValueError("CashAddr must not mix uppercase and lowercase")
+
+        address = address.lower()
+        if ':' not in address:
+            address = 'bitcoincash:' + address
+        elif not address.startswith('bitcoincash:'):
+            raise ValueError("only Bitcoin Cash mainnet CashAddr is supported")
 
     try:
         legacy = convert.to_legacy_address(address)
     except Exception as e:
         raise ValueError(f"invalid Bitcoin Cash payout address: {payout_address}") from e
 
-    decoded = base58.b58decode_check(legacy)
+    try:
+        decoded = base58.b58decode_check(legacy)
+    except Exception as e:
+        raise ValueError(f"invalid legacy payout address: {payout_address}") from e
+
     if len(decoded) != 21:
         raise ValueError("payout address payload must contain a 20-byte hash")
 
     version = decoded[0]
     payload_hex = decoded[1:].hex()
-    if version in (0x00, 0x6f):
+    if version == 0x00:
         return "76a914" + payload_hex + "88ac"
-    if version in (0x05, 0xc4):
+    if version == 0x05:
         return "a914" + payload_hex + "87"
-    raise ValueError(f"unsupported legacy address version 0x{version:02x}")
+    raise ValueError(
+        f"unsupported payout address network/version 0x{version:02x}; "
+        "Bitcoin Cash mainnet address required"
+    )
 
 
 def _validated_payout_address(payout_address: str) -> str:
@@ -532,10 +548,8 @@ def gbt_poller():
     last_txids = None
     while True:
         try:
-            # request getblocktemplate, request coinbasetxn 支持(???)
-            # params can be adjusted according to node support
-            # gbt = rpc_call("getblocktemplate", [{"capabilities": ["coinbasetxn", "workid"]}])
-            gbt = rpc_call("getblocktemplate", [{"rules": ["segwit"]}])     # remove ["segwit"] ??? 
+            # BCHN does not support SegWit template negotiation.
+            gbt = rpc_call("getblocktemplate")
             if not gbt:
                 time.sleep(GBT_POLL_INTERVAL)
                 continue
