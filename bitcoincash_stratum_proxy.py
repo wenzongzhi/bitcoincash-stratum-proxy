@@ -22,10 +22,11 @@ import time
 import json
 import os
 import binascii
+from fractions import Fraction
 from hashlib import sha256
 import requests
 from typing import List, Dict, Any, Optional, Tuple
-from queue import Queue
+from queue import Empty, Full, Queue
 
 # ===========================
 # === 用户配置区（必须修改）===
@@ -53,6 +54,12 @@ DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
 
 # 设置ASIC矿机有效share的最小难度
 MIN_SHARE_DIFF = 100_000  # 全局配置，矿机提交的share难度必须大于100K
+
+# Stratum difficulty 1 uses Bitcoin's historical difficulty-1 target.
+DIFF1_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
+VERSION_ROLLING_SERVER_MASK = 0x1FFFE000
+MAX_JOBS_PER_MINER = 8
+SUBMIT_QUEUE_STOP = object()
 
 # RPC 调用超时和重试
 RPC_TIMEOUT = 10
@@ -147,6 +154,75 @@ def compact_to_target(nbits_hex: str) -> int:
     except Exception as e:
         log("compact_to_target 错误:", e)
         return 0
+
+
+def difficulty_to_target(difficulty: float) -> int:
+    """Convert Stratum difficulty to its inclusive share target."""
+    if isinstance(difficulty, bool) or not isinstance(difficulty, (int, float)):
+        raise ValueError("difficulty must be positive")
+    difficulty_fraction = Fraction(str(difficulty))
+    if difficulty_fraction <= 0:
+        raise ValueError("difficulty must be positive")
+    return max(
+        1,
+        DIFF1_TARGET
+        * difficulty_fraction.denominator
+        // difficulty_fraction.numerator,
+    )
+
+
+def hash_to_difficulty(hash_value: int) -> float:
+    """Return standard Stratum/Bitcoin difficulty for a positive hash value."""
+    if hash_value < 0:
+        raise ValueError("hash value must not be negative")
+    return DIFF1_TARGET / max(1, hash_value)
+
+
+def _parse_fixed_hex(value: Any, byte_length: int, field_name: str) -> str:
+    """Validate and normalize a fixed-size big-endian hexadecimal field."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a hexadecimal string")
+    normalized = value.strip().lower()
+    if normalized.startswith("0x"):
+        normalized = normalized[2:]
+    if len(normalized) != byte_length * 2:
+        raise ValueError(f"{field_name} must be exactly {byte_length} bytes")
+    if any(char not in "0123456789abcdef" for char in normalized):
+        raise ValueError(f"{field_name} contains non-hexadecimal characters")
+    return normalized
+
+
+def apply_version_rolling(
+    job_version_hex: str,
+    version_bits_hex: Optional[str],
+    enabled: bool,
+    mask: int,
+) -> int:
+    """Apply BIP310 version bits and return the resulting uint32 version."""
+    job_version = int(_parse_fixed_hex(job_version_hex, 4, "job version"), 16)
+    if not enabled:
+        if version_bits_hex is not None:
+            raise ValueError("version rolling was not negotiated")
+        return job_version
+
+    if version_bits_hex is None:
+        raise ValueError("version_bits is required after version rolling negotiation")
+    version_bits = int(
+        _parse_fixed_hex(version_bits_hex, 4, "version_bits"),
+        16,
+    )
+    if version_bits & ~mask:
+        raise ValueError("version_bits contains bits outside the negotiated mask")
+    return (job_version & ~mask) | (version_bits & mask)
+
+
+def stratum_prevhash_to_header_hex(prevhash_hex: str) -> str:
+    """Convert Stratum V1 word-swapped prevhash to serialized header bytes."""
+    normalized = _parse_fixed_hex(prevhash_hex, 32, "previous block hash")
+    return "".join(
+        reverse_hex(normalized[index:index + 8])
+        for index in range(0, 64, 8)
+    )
 
 def bits_hex_to_int(bits_hex: str) -> int:
     return int(bits_hex, 16)
@@ -391,14 +467,14 @@ def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
     lock_time = "00000000"
     return sequence + output_count + output + lock_time
     
-def _compute_merkle_branch(tx_hashes_be: List[bytes]) -> List[str]:
+def _compute_merkle_branch(tx_hashes_internal: List[bytes]) -> List[str]:
     """
     Build the sibling path for the coinbase leaf at index zero.
 
     None represents the subtree containing the coinbase. The returned branch
     therefore depends only on non-coinbase transactions.
     """
-    nodes: List[Optional[bytes]] = [None] + tx_hashes_be
+    nodes: List[Optional[bytes]] = [None] + tx_hashes_internal
     branch: List[str] = []
 
     while len(nodes) > 1:
@@ -441,6 +517,25 @@ def _get_template_tx_hashes(transactions: List[Dict[str, Any]]) -> List[bytes]:
     return hashes
 
 
+def _get_template_transaction_data(
+    transactions: List[Dict[str, Any]],
+) -> List[str]:
+    """Return every raw template transaction, failing on incomplete templates."""
+    raw_transactions: List[str] = []
+    for index, tx in enumerate(transactions):
+        data = tx.get("data")
+        if not isinstance(data, str) or not data:
+            raise ValueError(f"GBT transaction {index} has no raw data")
+        try:
+            hex_to_bytes(data)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(
+                f"GBT transaction {index} contains invalid raw data"
+            ) from e
+        raw_transactions.append(data)
+    return raw_transactions
+
+
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         # 1) header components, version
@@ -455,7 +550,7 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(prevhash_rpc) != 64:
             raise ValueError("GBT previousblockhash must be 32 bytes")
         words = [prevhash_rpc[i:i+8] for i in range(0, 64, 8)]
-        prevhash_be = ''.join(reversed(words))
+        prevhash_stratum = ''.join(reversed(words))
 
         # bits: for example "180170da"
         # bits = gbt.get('bits')
@@ -476,15 +571,15 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
         coinb1 = build_coinbase_1(height, gbt.get('coinbaseaux'))
         transactions = gbt.get('transactions', [])
-        tx_hashes_be = _get_template_tx_hashes(transactions)
-        merkle_branch = _compute_merkle_branch(tx_hashes_be)
+        tx_hashes_internal = _get_template_tx_hashes(transactions)
+        merkle_branch = _compute_merkle_branch(tx_hashes_internal)
 
-        job_id = f"{int(time.time())}_{prevhash_be[-8:]}"
+        job_id = f"{time.time_ns():x}_{prevhash_stratum[-8:]}"
 
         job = {
             "job_id": job_id,
             "gbt": gbt,
-            "prevhash_be": prevhash_be,
+            "prevhash_stratum": prevhash_stratum,
             "version_be": version_be,
             "nbits_be": nbits_be,
             "ntime_be": ntime_be,
@@ -533,13 +628,17 @@ def gbt_poller():
             txids = tuple(tx.get('txid') for tx in gbt.get('transactions', []))
 
             need_broadcast = False
+            clean_jobs = False
+            job_to_broadcast = None
             reason = ""
             with _gbt_lock:
                 if _current_gbt is None:
                     need_broadcast = True
+                    clean_jobs = True
                     reason = "initial GBT"
                 elif gbt.get('previousblockhash') != _current_gbt.get('previousblockhash'):
                     need_broadcast = True
+                    clean_jobs = True
                     reason = f"detected new block, height is {height}"
                 elif txids != last_txids:
                     need_broadcast = True
@@ -550,14 +649,18 @@ def gbt_poller():
 
                 # update cache
                 if need_broadcast:
-                    _current_gbt = gbt  # store new gbt dict data to _current_gbt
-                    _current_job = build_job_from_gbt(gbt)
-                    _current_height = height
-                    last_txids = txids
+                    candidate_job = build_job_from_gbt(gbt)
+                    if candidate_job:
+                        candidate_job["clean_jobs"] = clean_jobs
+                        _current_gbt = gbt
+                        _current_job = candidate_job
+                        _current_height = height
+                        last_txids = txids
+                        job_to_broadcast = candidate_job
 
-            if need_broadcast and _current_job:
+            if job_to_broadcast:
                 log("boardcast new job to ASIC:", reason, "height=", height, "txs=", len(txids))
-                broadcast_job_to_miners(_current_job)
+                broadcast_job_to_miners(job_to_broadcast)
             time.sleep(GBT_POLL_INTERVAL)
         except Exception as e:
             log("GBT polling exception", e)
@@ -587,11 +690,10 @@ class StratumMinerHandler(threading.Thread):
         self.authorized = False
         self.worker_name = "unknown"
         self.payout_address = DEFAULT_PAYOUT_ADDRESS
-        self.current_coinb2: Optional[str] = None
         
-        self.difficulty = 1
+        self.difficulty = MIN_SHARE_DIFF
         self.version_rolling = False
-        self.version_rolling_mask = "1fffe000"
+        self.version_rolling_mask = 0
 
         # Each miner connection gets a stable proxy-assigned extranonce1.
         self.extranonce1 = os.urandom(EXTRANONCE1_BYTES).hex()
@@ -599,10 +701,12 @@ class StratumMinerHandler(threading.Thread):
 
         # assign the job id (string)
         self.current_job_id: Optional[str] = None
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.jobs_lock = threading.Lock()
         
         # use fifo to put and get the sumbit data of ASIC miner
         self.submit_queue = Queue(maxsize=1000)
-        self.start_submit_worker()  # Start the submit processing thread
+        self.submit_thread = self.start_submit_worker()
         
         # socket read buffer
         self._buffer = ""
@@ -648,15 +752,21 @@ class StratumMinerHandler(threading.Thread):
             log("miner disconnected:", self.addr)
 
     def close(self):
+        if not self.running:
+            return
         self.running = False
         
-        # clear queue
-        while not self.submit_queue.empty():
+        # Wake the submit worker and discard queued shares for this connection.
+        while True:
             try:
                 self.submit_queue.get_nowait()
                 self.submit_queue.task_done()
-            except:
+            except Empty:
                 break
+        try:
+            self.submit_queue.put_nowait(SUBMIT_QUEUE_STOP)
+        except Full:
+            pass
             
         try:
             with _miners_lock:
@@ -698,6 +808,10 @@ class StratumMinerHandler(threading.Thread):
         }
         self.subscribed = True
         self.send_json(resp)
+        if self.authorized:
+            with _gbt_lock:
+                if _current_job:
+                    self.send_job(_current_job, force_clean_jobs=True)
         
     def send_set_difficulty(self, difficulty):
         self.difficulty = difficulty
@@ -719,27 +833,59 @@ class StratumMinerHandler(threading.Thread):
         })
         
     def send_configure_response(self, req_id, params):
-        extensions = []
-        options = {}
+        if (
+            not isinstance(params, list)
+            or len(params) < 2
+            or not isinstance(params[0], list)
+            or not isinstance(params[1], dict)
+        ):
+            self.send_json({
+                "id": req_id,
+                "result": None,
+                "error": [20, "Invalid mining.configure parameters", None],
+            })
+            return
 
-        if len(params) >= 1:
-            extensions = params[0]
-
-        if len(params) >= 2:
-            options = params[1]
+        extensions = params[0]
+        options = params[1]
+        if any(not isinstance(extension, str) for extension in extensions):
+            self.send_json({
+                "id": req_id,
+                "result": None,
+                "error": [20, "Invalid mining.configure extension list", None],
+            })
+            return
 
         result = {}
 
         if "version-rolling" in extensions:
-            self.version_rolling = True
+            try:
+                requested_mask = int(
+                    _parse_fixed_hex(
+                        options.get("version-rolling.mask", "ffffffff"),
+                        4,
+                        "version-rolling.mask",
+                    ),
+                    16,
+                )
+                negotiated_mask = VERSION_ROLLING_SERVER_MASK & requested_mask
+                minimum_bits = int(
+                    options.get("version-rolling.min-bit-count", 0)
+                )
+                if minimum_bits < 0:
+                    raise ValueError("minimum bit count must not be negative")
 
-            requested_mask = options.get(
-                "version-rolling.mask",
-                self.version_rolling_mask
-            )
+                self.version_rolling = True
+                self.version_rolling_mask = negotiated_mask
+                result["version-rolling"] = True
+                result["version-rolling.mask"] = f"{negotiated_mask:08x}"
+            except (TypeError, ValueError) as e:
+                self.version_rolling = False
+                self.version_rolling_mask = 0
+                result["version-rolling"] = str(e)
 
-            result["version-rolling"] = True
-            result["version-rolling.mask"] = requested_mask
+        for extension in extensions:
+            result.setdefault(extension, False)
 
         self.send_json({
             "id": req_id,
@@ -753,7 +899,7 @@ class StratumMinerHandler(threading.Thread):
             self.authorized = True
         self.send_json(resp)
 
-    def send_job(self, job: Dict[str, Any]):
+    def send_job(self, job: Dict[str, Any], force_clean_jobs: bool = False):
         """
         send the job to ASIC miners (mining.notify)
         Stratum mining.notify
@@ -763,14 +909,6 @@ class StratumMinerHandler(threading.Thread):
         """
         if not job:
             return
-        # 下发难度（solo 挖矿用网络难度）
-        difficulty = MIN_SHARE_DIFF  # 或从 nbits 计算
-        diff_msg = {"id": None, "method": "mining.set_difficulty", "params": [difficulty]}
-        self.send_json(diff_msg)
-
-        # 延迟 50ms 避免粘包
-        time.sleep(0.05)
-        
         # coinb2 is specific to this miner's validated payout address.
         coinb1 = job.get('coinb1', '')
         coinbase_value = int(job.get('coinbase_value', 0))
@@ -783,7 +921,19 @@ class StratumMinerHandler(threading.Thread):
             )
             self.payout_address = _validated_payout_address(DEFAULT_PAYOUT_ADDRESS)
             coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
-        self.current_coinb2 = coinb2
+        clean_jobs = force_clean_jobs or bool(job.get("clean_jobs", False))
+        job_for_miner = dict(job)
+        job_for_miner["coinb2"] = coinb2
+        job_for_miner["clean_jobs"] = clean_jobs
+        jid = str(job_for_miner.get('job_id'))
+
+        with self.jobs_lock:
+            if clean_jobs:
+                self.jobs.clear()
+            self.jobs[jid] = job_for_miner
+            while len(self.jobs) > MAX_JOBS_PER_MINER:
+                oldest_job_id = next(iter(self.jobs))
+                self.jobs.pop(oldest_job_id, None)
 
         extranonce2_placeholder = '00' * self.extranonce2_size
 
@@ -793,7 +943,6 @@ class StratumMinerHandler(threading.Thread):
         # 长度校验
         if len(full_coinb_hex) < 100 or len(full_coinb_hex) > 5000:
             log(f"警告: 下发 coinbase 长度异常 len={len(full_coinb_hex)} job_id={job.get('job_id')}")
-        jid = job.get('job_id')
         self.current_job_id = jid
 
         branch = job.get('merkle_branch', [])
@@ -803,36 +952,39 @@ class StratumMinerHandler(threading.Thread):
         
         params = [
             jid,
-            job.get('prevhash_be'),
+            job.get('prevhash_stratum'),
             coinb1,
             coinb2 or "",
             branch,  # 已截断的安全 branch
             job.get('version_be'),
             job.get('nbits_be'),
             job.get('ntime_be'),
-            False  # clean_jobs=False
+            clean_jobs
         ]
         notify = {"id": None, "method": "mining.notify", "params": params}
         self.send_json(notify)
-        log(f"peoxy send job -> miner {self.addr}, job_id={jid}, coinb1_len={len(coinb1)}, coinb2_len={len(coinb2)}")
+        log(f"proxy send job -> miner {self.addr}, job_id={jid}, coinb1_len={len(coinb1)}, coinb2_len={len(coinb2)}")
 
-    def start_submit_worker(self):
+    def start_submit_worker(self) -> threading.Thread:
         t = threading.Thread(
             target=self.submit_worker,
             daemon=True
         )
         t.start()
+        return t
 
     def submit_worker(self):
-        while True:
-            item = self.submit_queue.get()  # if no data put into self.submit_queue, thread flow will block in here
+        while self.running:
+            item = self.submit_queue.get()
 
             try:
+                if item is SUBMIT_QUEUE_STOP:
+                    return
                 self.handle_submit(*item)
             except Exception as e:
                 log("submit worker error:", e)
-
-            self.submit_queue.task_done()
+            finally:
+                self.submit_queue.task_done()
             
     # -----------------------
     # --- Proxy receive the message from ASIC miner ---
@@ -851,8 +1003,13 @@ class StratumMinerHandler(threading.Thread):
         elif method == "mining.suggest_difficulty":
             self.send_json({"id": req_id, "result": True, "error": None})
         elif method == "mining.multi_version":
+            self.version_rolling = True
+            self.version_rolling_mask = VERSION_ROLLING_SERVER_MASK
             self.send_json({"id": req_id, "result": True, "error": None})
         elif method == "mining.authorize":
+            if not isinstance(params, list) or not params:
+                self.send_authorize_response(req_id, ok=False)
+                return
             full_worker = params[0] if params else "unknown"
             # Address resolution: Supports user.worker, user, or address.
             parts = str(full_worker).split('.', 1)
@@ -870,16 +1027,22 @@ class StratumMinerHandler(threading.Thread):
             self.worker_name = parts[1] if len(parts) > 1 else ""
             self.send_authorize_response(req_id, ok=True)
 
-            self.send_set_difficulty(1)
-            self.send_set_extranonce()
+            self.send_set_difficulty(MIN_SHARE_DIFF)
 
             # If the current job already exists after subscription, it will be delivered immediately.
             with _gbt_lock:
-                if _current_job:
-                    self.send_job(_current_job)
+                if self.subscribed and _current_job:
+                    self.send_job(_current_job, force_clean_jobs=True)
         elif method == "mining.submit":
             # params: [workername, job_id, extranonce2, ntime, nonce] or [workername, job_id, extranonce2, ntime, nonce, version] 
-            # if the elements are more than 5, how to deal with?
+            if not isinstance(params, list) or len(params) < 5:
+                self.send_json({
+                    "id": req_id,
+                    "result": False,
+                    "error": [20, "Invalid mining.submit parameters", None],
+                })
+                return
+
             worker = params[0]
             job_id = params[1]
             extranonce2 = params[2]
@@ -888,7 +1051,23 @@ class StratumMinerHandler(threading.Thread):
             version_bits = params[5] if len(params) > 5 else None
             
             try:
-                self.submit_queue.put((req_id, worker, job_id, extranonce2, ntime_hex, nonce_hex, version_bits))
+                self.submit_queue.put_nowait(
+                    (
+                        req_id,
+                        worker,
+                        job_id,
+                        extranonce2,
+                        ntime_hex,
+                        nonce_hex,
+                        version_bits,
+                    )
+                )
+            except Full:
+                self.send_json({
+                    "id": req_id,
+                    "result": False,
+                    "error": [20, "Submit queue full", None],
+                })
             except Exception as e:
                 log("Failed to queue submit:", e)
         else:
@@ -917,42 +1096,52 @@ class StratumMinerHandler(threading.Thread):
         """
     # ==================== 6. handle_submit（核心） ====================
         try:
-            with _gbt_lock:
-                job = _current_job
-                gbt = _current_gbt
-            if not job or job_id != job.get('job_id'):
+            with self.jobs_lock:
+                job = self.jobs.get(str(job_id))
+            if not job:
                 self.send_json({"id": req_id, "result": False, "error": [21, "Stale", None]})
                 return
+            gbt = job.get("gbt")
+            if not isinstance(gbt, dict):
+                raise ValueError("job has no block template")
 
             # ---------- 1. coinbase ----------
             coinb1 = job.get('coinb1', '')
-            coinb2 = self.current_coinb2
-            if not coinb2:
-                coinb2 = build_coinbase_2(
-                    self.payout_address,
-                    int(job.get('coinbase_value', 0)),
-                )
-            ex2 = (extranonce2 or '').rjust(self.extranonce2_size*2, '0')[:self.extranonce2_size*2]
+            coinb2 = job.get("coinb2")
+            if not isinstance(coinb2, str):
+                raise ValueError("job has no miner-specific coinbase2")
+            ex2 = _parse_fixed_hex(
+                extranonce2,
+                self.extranonce2_size,
+                "extranonce2",
+            )
 
             coinbase_hex = coinb1 + self.extranonce1 + ex2 + coinb2
 
             # ---------- 2. merkle ----------
-            merkle_root_be = dsha256(hex_to_bytes(coinbase_hex))
+            merkle_root_internal = dsha256(hex_to_bytes(coinbase_hex))
             for sibling_hex in job.get('merkle_branch', []):
-                merkle_root_be = dsha256(
-                    merkle_root_be + hex_to_bytes(sibling_hex)
+                merkle_root_internal = dsha256(
+                    merkle_root_internal + hex_to_bytes(sibling_hex)
                 )
             #version_le = int_to_le_hex(gbt.get('version', 0), 4)
-            version_le = reverse_hex(job['version_be'])
-            prevhash_le    = reverse_hex(job.get('prevhash_be'))  # BE hex → LE hex
+            header_version = apply_version_rolling(
+                job['version_be'],
+                version_bits,
+                self.version_rolling,
+                self.version_rolling_mask,
+            )
+            version_le = int_to_le_hex(header_version, 4)
+            prevhash_le = stratum_prevhash_to_header_hex(
+                job.get('prevhash_stratum')
+            )
 
-            merkle_root_be_hex = bytes_to_hex(merkle_root_be)  # BE bytes → BE hex
-            merkle_root_le = reverse_hex(merkle_root_be_hex)  # BE hex → LE hex
-            ntime_le = parse_nonce_or_ntime_to_le(ntime_hex, 4)
+            merkle_root_le = bytes_to_hex(merkle_root_internal)
+            ntime_le = reverse_hex(_parse_fixed_hex(ntime_hex, 4, "ntime"))
             nbits_le = reverse_hex(job.get('nbits_be'))  # BE hex → LE hex
             #ntime_le = reverse_hex((ntime_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
             #nonce_le = reverse_hex((nonce_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
-            nonce_le = parse_nonce_or_ntime_to_le(nonce_hex, 4)  # note: parse here too
+            nonce_le = reverse_hex(_parse_fixed_hex(nonce_hex, 4, "nonce"))
             
             header_le = (
                 version_le + prevhash_le + merkle_root_le +
@@ -972,23 +1161,24 @@ class StratumMinerHandler(threading.Thread):
                 return
 
             # share difficulty
-            share_diff = (1 << 256) // (header_hash_int + 1)  # MODIFIED: use 1<<256
+            share_target = difficulty_to_target(self.difficulty)
+            share_diff = hash_to_difficulty(header_hash_int)
 
             # 1. 难度太低 → reject
-            if share_diff < MIN_SHARE_DIFF:
+            if header_hash_int > share_target:
                 self.send_json({"id": req_id, "result": False, "error": [25, "Low diff", None]})
-                log(f"拒绝 share: diff={share_diff} (未达最小提交难度 {MIN_SHARE_DIFF}，不上报)")
+                log(
+                    f"Reject share: diff={share_diff:.3f} "
+                    f"(required {self.difficulty})"
+                )
                 return
 
             # 2. 达到网络难度 → submitblock
             if header_hash_int <= network_target:
                 # 构造完整区块并提交
-                txs = [coinbase_hex]
-                for tx in gbt.get('transactions', []):
-                    if tx.get('data'):
-                        txs.append(tx['data'])
-                if gbt.get('default_witness_commitment'):
-                    txs.append(gbt['default_witness_commitment'])
+                txs = [coinbase_hex] + _get_template_transaction_data(
+                    gbt.get('transactions', [])
+                )
 
                 block_bytes = hex_to_bytes(header_le)  # 注意: 用 header_le
                 block_bytes += hex_to_bytes(varint_encode(len(txs)))
@@ -998,42 +1188,32 @@ class StratumMinerHandler(threading.Thread):
                 result = rpc_call("submitblock", [bytes_to_hex(block_bytes)])
                 accepted = result is None
                 self.send_json({"id": req_id, "result": accepted, "error": None if accepted else [22, str(result), None]})
-                log(f"区块提交: {'成功' if accepted else '失败'} share_diff={share_diff} hash={header_hash_int:064x}")
+                log(
+                    f"Block submit: {'accepted' if accepted else 'rejected'} "
+                    f"share_diff={share_diff:.3f} hash={header_hash_int:064x}"
+                )
             else:
                 # 3. 达到 MIN_SHARE_DIFF 但未达网络难度 → accept 但不上报
                 self.send_json({"id": req_id, "result": True, "error": None})
-                log(f"接受 share: diff={share_diff} (未达网络难度，不上报)")
+                log(
+                    f"Accept share: diff={share_diff:.3f} "
+                    "(below network difficulty)"
+                )
             return
+        except ValueError as e:
+            log("Invalid share submission:", e)
+            self.send_json({
+                "id": req_id,
+                "result": False,
+                "error": [20, str(e), None],
+            })
         except Exception as e:
             log("处理 submit 异常:", e)
             self.send_json({"id": req_id, "result": False, "error": [23, "Internal proxy error", None]})
 
-# ===========================
-# === Merkle 核心实现（big-endian node bytes）===
-# ===========================
-def _build_merkle_root_be(leaves_be: List[bytes]) -> bytes:
-    """
-    标准 Merkle Tree 构造（big-endian hash）
-    输入：所有交易的 double-sha256 hash（BE bytes）
-    输出：merkle root（BE bytes）
-
-    if not leaves_be:
-        return b'\x00' * 32
-    nodes = leaves_be[:]
-    while len(nodes) > 1:
-        if len(nodes) % 2 == 1:
-            nodes.append(nodes[-1])  # 奇数时复制最后一个
-        next_level = []
-        for i in range(0, len(nodes), 2):
-            left = nodes[i]
-            right = nodes[i + 1]
-            combined = left + right
-            next_level.append(dsha256(combined))
-        nodes = next_level
-    return nodes[0]
-    """
-    """根据交易 hash 列表计算 Merkle root（返回 big-endian bytes）"""
-    hashes = leaves_be.copy()
+def _build_merkle_root_internal(leaves_internal: List[bytes]) -> bytes:
+    """Build a Merkle root from hashes in internal uint256 byte order."""
+    hashes = leaves_internal.copy()
     if not hashes:
         return b'\x00' * 32
     while len(hashes) > 1:
