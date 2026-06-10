@@ -53,8 +53,10 @@ COINBASE_TAG = b"/BitcoinCash Stratum Proxy/"
 # 默认支付地址（当矿工未提供时使用）
 DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
 
-# 设置ASIC矿机有效share的最小难度
-MIN_SHARE_DIFF = 100_000  # 全局配置，矿机提交的share难度必须大于100K
+# Share difficulty announced to connected miners. 2048 gives Bitaxe and
+# NerdQaxe devices regular health-check shares without affecting solo blocks.
+MIN_SHARE_DIFF = 2_048
+ENABLE_BLOCK_PROPOSAL_CHECK = True
 
 # Stratum difficulty 1 uses Bitcoin's historical difficulty-1 target.
 DIFF1_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -368,8 +370,7 @@ def _encode_height_to_coinbase(height: int) -> str:
     return bytes([len(encoded)]).hex() + encoded.hex()
 
 def _build_minimal_coinbase_tx(height_bytes_hex: str) -> str:
-    # A minimal coinbase tx, used only in the extreme case where the node does not return coinbasetxn.data.
-    # this is unused function, just for reference
+    # Unused reference helper; production jobs use build_coinbase_1/2.
     version = "01000000"
     tx_in_count = "01"
     prev_out = "00" * 32 + "ffffffff"
@@ -397,9 +398,19 @@ def build_coinbase_1(height: int, coinbase_aux: Optional[Dict[str, Any]] = None)
     """
     height_push = bytes.fromhex(_encode_height_to_coinbase(height))
     aux_data = b""
-    for value in (coinbase_aux or {}).values():
-        if value:
-            aux_data += bytes.fromhex(str(value))
+    if coinbase_aux is not None and not isinstance(coinbase_aux, dict):
+        raise ValueError("GBT coinbaseaux must be an object")
+    for key, value in (coinbase_aux or {}).items():
+        if not isinstance(value, str):
+            raise ValueError(f"GBT coinbaseaux {key!r} must be hexadecimal")
+        if not value:
+            continue
+        try:
+            aux_data += bytes.fromhex(value)
+        except ValueError as e:
+            raise ValueError(
+                f"GBT coinbaseaux {key!r} contains invalid hexadecimal"
+            ) from e
 
     script_prefix = height_push + aux_data + COINBASE_TAG
     extranonce_size = EXTRANONCE1_BYTES + EXTRANONCE2_BYTES
@@ -573,6 +584,53 @@ def _get_template_transaction_data(
     return raw_transactions
 
 
+def _template_supports_proposal(gbt: Dict[str, Any]) -> bool:
+    capabilities = gbt.get("capabilities", [])
+    return (
+        isinstance(capabilities, list)
+        and "proposal" in capabilities
+    )
+
+
+def _build_block_rpc_params(
+    block_hex: str,
+    workid: Any = None,
+) -> List[Any]:
+    params: List[Any] = [block_hex]
+    if workid is not None:
+        params.append({"workid": workid})
+    return params
+
+
+def validate_block_proposal(
+    block_hex: str,
+    gbt: Dict[str, Any],
+) -> Tuple[bool, Optional[str]]:
+    """
+    Validate a solved block without its proof-of-work check.
+
+    Explicit proposal rejection stops submission. RPC/transport failures are
+    fail-open so a valid solo block is never lost because of the extra check.
+    """
+    if not ENABLE_BLOCK_PROPOSAL_CHECK or not _template_supports_proposal(gbt):
+        return True, None
+
+    request: Dict[str, Any] = {
+        "mode": "proposal",
+        "data": block_hex,
+    }
+    if gbt.get("workid") is not None:
+        request["workid"] = gbt["workid"]
+
+    proposal = rpc_call("getblocktemplate", [request])
+    if not proposal.ok:
+        log("Block proposal check unavailable; submitting anyway:", proposal.error)
+        return True, None
+    if proposal.result is None:
+        return True, None
+    return False, str(proposal.result)
+
+
 def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     try:
         # 1) header components, version
@@ -587,7 +645,7 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if len(prevhash_rpc) != 64:
             raise ValueError("GBT previousblockhash must be 32 bytes")
         words = [prevhash_rpc[i:i+8] for i in range(0, 64, 8)]
-        prevhash_stratum = ''.join(reversed(words))
+        prevhash_stratum_word_swapped = ''.join(reversed(words))
 
         # bits: for example "180170da"
         # bits = gbt.get('bits')
@@ -599,24 +657,35 @@ def build_job_from_gbt(gbt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         curtime = int(gbt.get('curtime', int(time.time())))
         ntime_be = int_to_be_hex(curtime, 4)
 
-        # 2) coinbase deal: Bitcoin can use coinbasetxn.data, Bitcoincash doesn't support coinbasetxn.data 
-        # the bitcoin coinbase will be developed in feature
-        # there is no coinbasetxn in bitcoincash blocktemplate, coinbase should be manually created by proxy
+        # Build a mutable coinbase around the per-connection extranonce and
+        # payout address. This path requires the template's coinbasevalue.
         height = gbt.get('height')
-        coinbase_value = gbt.get('coinbasevalue', 0)
-        if height is None or coinbase_value == 0:
-            return None
+        coinbase_value = gbt.get('coinbasevalue')
+        if height is None:
+            raise ValueError("GBT has no next-block height")
+        if not isinstance(coinbase_value, int) or coinbase_value <= 0:
+            if gbt.get("coinbasetxn"):
+                raise ValueError(
+                    "GBT returned coinbasetxn without coinbasevalue; "
+                    "custom per-miner payout construction is unsupported"
+                )
+            raise ValueError("GBT has no valid coinbasevalue")
         coinb1 = build_coinbase_1(height, gbt.get('coinbaseaux'))
         transactions = gbt.get('transactions', [])
         tx_hashes_internal = _get_template_tx_hashes(transactions)
         merkle_branch = _compute_merkle_branch(tx_hashes_internal)
 
-        job_id = f"{time.time_ns():x}_{prevhash_stratum[-8:]}"
+        job_id = (
+            f"{time.time_ns():x}_"
+            f"{prevhash_stratum_word_swapped[-8:]}"
+        )
 
         job = {
             "job_id": job_id,
             "gbt": gbt,
-            "prevhash_stratum": prevhash_stratum,
+            "prevhash_stratum_word_swapped": (
+                prevhash_stratum_word_swapped
+            ),
             "version_be": version_be,
             "nbits_be": nbits_be,
             "ntime_be": ntime_be,
@@ -654,8 +723,16 @@ def gbt_poller():
     last_txids = None
     while True:
         try:
-            # BCHN does not support SegWit template negotiation.
-            rpc_result = rpc_call("getblocktemplate")
+            rpc_result = rpc_call(
+                "getblocktemplate",
+                [{
+                    "capabilities": [
+                        "coinbasevalue",
+                        "proposal",
+                        "workid",
+                    ]
+                }],
+            )
             if not rpc_result.ok or not isinstance(rpc_result.result, dict):
                 time.sleep(GBT_POLL_INTERVAL)
                 continue
@@ -912,6 +989,13 @@ class StratumMinerHandler(threading.Thread):
                 )
                 if minimum_bits < 0:
                     raise ValueError("minimum bit count must not be negative")
+                if negotiated_mask.bit_count() < minimum_bits:
+                    log(
+                        f"Miner {self.addr} requested {minimum_bits} "
+                        "version-rolling bits, but only "
+                        f"{negotiated_mask.bit_count()} are available; "
+                        "continuing in degraded mode"
+                    )
 
                 self.version_rolling = True
                 self.version_rolling_mask = negotiated_mask
@@ -984,7 +1068,7 @@ class StratumMinerHandler(threading.Thread):
         
         params = [
             jid,
-            job.get('prevhash_stratum'),
+            job.get('prevhash_stratum_word_swapped'),
             coinb1,
             coinb2 or "",
             branch,  # 已截断的安全 branch
@@ -1174,8 +1258,8 @@ class StratumMinerHandler(threading.Thread):
                 self.version_rolling_mask,
             )
             version_le = int_to_le_hex(header_version, 4)
-            prevhash_le = stratum_prevhash_to_header_hex(
-                job.get('prevhash_stratum')
+            prevhash_header_le = stratum_prevhash_to_header_hex(
+                job.get('prevhash_stratum_word_swapped')
             )
 
             merkle_root_le = bytes_to_hex(merkle_root_internal)
@@ -1187,7 +1271,7 @@ class StratumMinerHandler(threading.Thread):
             nonce_le = reverse_hex(_parse_fixed_hex(nonce_hex, 4, "nonce"))
             
             header_le = (
-                version_le + prevhash_le + merkle_root_le +
+                version_le + prevhash_header_le + merkle_root_le +
                 ntime_le + nbits_le + nonce_le
             )
             header_le_bytes = hex_to_bytes(header_le)
@@ -1228,9 +1312,30 @@ class StratumMinerHandler(threading.Thread):
                 for t in txs:
                     block_bytes += hex_to_bytes(t)
 
+                block_hex = bytes_to_hex(block_bytes)
+                proposal_ok, proposal_error = validate_block_proposal(
+                    block_hex,
+                    gbt,
+                )
+                if not proposal_ok:
+                    self.send_json({
+                        "id": req_id,
+                        "result": False,
+                        "error": [
+                            22,
+                            f"Block proposal rejected: {proposal_error}",
+                            None,
+                        ],
+                    })
+                    log("Block proposal rejected:", proposal_error)
+                    return
+
                 rpc_result = rpc_call(
                     "submitblock",
-                    [bytes_to_hex(block_bytes)],
+                    _build_block_rpc_params(
+                        block_hex,
+                        gbt.get("workid"),
+                    ),
                 )
                 accepted = rpc_result.ok and rpc_result.result is None
                 submit_error = None
