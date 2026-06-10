@@ -22,6 +22,7 @@ import time
 import json
 import os
 import binascii
+from dataclasses import dataclass
 from fractions import Fraction
 from hashlib import sha256
 import requests
@@ -60,6 +61,7 @@ DIFF1_TARGET = 0x00000000FFFF000000000000000000000000000000000000000000000000000
 VERSION_ROLLING_SERVER_MASK = 0x1FFFE000
 MAX_JOBS_PER_MINER = 8
 SUBMIT_QUEUE_STOP = object()
+MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60
 
 # RPC 调用超时和重试
 RPC_TIMEOUT = 10
@@ -206,7 +208,7 @@ def apply_version_rolling(
         return job_version
 
     if version_bits_hex is None:
-        raise ValueError("version_bits is required after version rolling negotiation")
+        return job_version
     version_bits = int(
         _parse_fixed_hex(version_bits_hex, 4, "version_bits"),
         16,
@@ -223,6 +225,29 @@ def stratum_prevhash_to_header_hex(prevhash_hex: str) -> str:
         reverse_hex(normalized[index:index + 8])
         for index in range(0, 64, 8)
     )
+
+
+def validate_ntime(
+    ntime_hex: str,
+    gbt: Dict[str, Any],
+    now: Optional[int] = None,
+) -> int:
+    """Validate a submitted block timestamp against GBT and BCH time limits."""
+    ntime = int(_parse_fixed_hex(ntime_hex, 4, "ntime"), 16)
+    minimum = int(gbt.get("mintime", gbt.get("curtime", 0)))
+    if ntime < minimum:
+        raise ValueError(
+            f"ntime {ntime} is below template mintime {minimum}"
+        )
+
+    local_now = int(time.time()) if now is None else int(now)
+    node_time = int(gbt.get("curtime", local_now))
+    maximum = max(local_now, node_time) + MAX_FUTURE_BLOCK_TIME
+    if ntime > maximum:
+        raise ValueError(
+            f"ntime {ntime} exceeds maximum allowed time {maximum}"
+        )
+    return ntime
 
 def bits_hex_to_int(bits_hex: str) -> int:
     return int(bits_hex, 16)
@@ -286,7 +311,14 @@ def normalize_nbits_be(bits: Any) -> str:
 # === RPC encapsulation (with retry)===
 # =====================================
 # '= None' means List is optional params
-def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
+@dataclass(frozen=True)
+class RpcResult:
+    ok: bool
+    result: Any = None
+    error: Any = None
+
+
+def rpc_call(method: str, params: Optional[List[Any]] = None) -> RpcResult:
     url = f"http://{RPC_HOST}:{RPC_PORT}"   # f key word is mean format the string
     headers = {"content-type": "application/json"}
     payload = {"jsonrpc": "2.0", "id": "proxy", "method": method, "params": params or []}
@@ -298,16 +330,18 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> Optional[Any]:
             resp.raise_for_status()     # If there is an HTTP error, throw an exception.      
             data = resp.json()
             if data.get('error'):
-                # resp.json() will put json into dict, key is error or result. if error != null, this function will return None
                 log(f"RPC error for {method}:", data['error'])
-                return None
-            return data.get('result')   # result object should be the whole block template data
+                return RpcResult(ok=False, error=data['error'])
+            return RpcResult(ok=True, result=data.get('result'))
         except Exception as e:
             attempt += 1
             log(f"RPC call {method} attempt {attempt} failed:", e)
             time.sleep(RPC_RETRY_BACKOFF ** (attempt - 1))
     log(f"RPC call {method} failed after {RPC_MAX_RETRIES} attempts.")
-    return None
+    return RpcResult(
+        ok=False,
+        error=f"RPC transport failed after {RPC_MAX_RETRIES} attempts",
+    )
 
 # ===========================
 # === GBT -> Job Conversion and Broadcast ===
@@ -474,6 +508,9 @@ def _compute_merkle_branch(tx_hashes_internal: List[bytes]) -> List[str]:
     None represents the subtree containing the coinbase. The returned branch
     therefore depends only on non-coinbase transactions.
     """
+    if not tx_hashes_internal:
+        return []
+
     nodes: List[Optional[bytes]] = [None] + tx_hashes_internal
     branch: List[str] = []
 
@@ -618,10 +655,11 @@ def gbt_poller():
     while True:
         try:
             # BCHN does not support SegWit template negotiation.
-            gbt = rpc_call("getblocktemplate")
-            if not gbt:
+            rpc_result = rpc_call("getblocktemplate")
+            if not rpc_result.ok or not isinstance(rpc_result.result, dict):
                 time.sleep(GBT_POLL_INTERVAL)
                 continue
+            gbt = rpc_result.result
 
             height = gbt.get('height', -1)  # if can't get valid height value, return -1
             # get txid data, (in order to check the mempool update), txids = ("txid1", "txid2", "txid3",...)
@@ -689,7 +727,7 @@ class StratumMinerHandler(threading.Thread):
         self.subscribed = False
         self.authorized = False
         self.worker_name = "unknown"
-        self.payout_address = DEFAULT_PAYOUT_ADDRESS
+        self.payout_address: Optional[str] = None
         
         self.difficulty = MIN_SHARE_DIFF
         self.version_rolling = False
@@ -909,18 +947,12 @@ class StratumMinerHandler(threading.Thread):
         """
         if not job:
             return
+        if not self.payout_address:
+            raise ValueError("miner has no validated payout address")
         # coinb2 is specific to this miner's validated payout address.
         coinb1 = job.get('coinb1', '')
         coinbase_value = int(job.get('coinbase_value', 0))
-        try:
-            coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
-        except ValueError as e:
-            log(
-                f"Miner {self.addr} payout address is unusable, "
-                f"falling back to default address: {e}"
-            )
-            self.payout_address = _validated_payout_address(DEFAULT_PAYOUT_ADDRESS)
-            coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
+        coinb2 = build_coinbase_2(self.payout_address, coinbase_value)
         clean_jobs = force_clean_jobs or bool(job.get("clean_jobs", False))
         job_for_miner = dict(job)
         job_for_miner["coinb2"] = coinb2
@@ -1021,7 +1053,17 @@ class StratumMinerHandler(threading.Thread):
                     f"Miner {self.addr} submitted invalid payout address "
                     f"{submitted_address!r}; using default address: {e}"
                 )
-                address = _validated_payout_address(DEFAULT_PAYOUT_ADDRESS)
+                try:
+                    address = _validated_payout_address(
+                        DEFAULT_PAYOUT_ADDRESS
+                    )
+                except ValueError as default_error:
+                    log(
+                        "Rejecting authorization because both miner and "
+                        f"default payout addresses are invalid: {default_error}"
+                    )
+                    self.send_authorize_response(req_id, ok=False)
+                    return
 
             self.payout_address = address
             self.worker_name = parts[1] if len(parts) > 1 else ""
@@ -1137,7 +1179,8 @@ class StratumMinerHandler(threading.Thread):
             )
 
             merkle_root_le = bytes_to_hex(merkle_root_internal)
-            ntime_le = reverse_hex(_parse_fixed_hex(ntime_hex, 4, "ntime"))
+            ntime = validate_ntime(ntime_hex, gbt)
+            ntime_le = int_to_le_hex(ntime, 4)
             nbits_le = reverse_hex(job.get('nbits_be'))  # BE hex → LE hex
             #ntime_le = reverse_hex((ntime_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
             #nonce_le = reverse_hex((nonce_hex or '').rjust(8, '0')[:8])# BE hex → LE hex
@@ -1185,9 +1228,27 @@ class StratumMinerHandler(threading.Thread):
                 for t in txs:
                     block_bytes += hex_to_bytes(t)
 
-                result = rpc_call("submitblock", [bytes_to_hex(block_bytes)])
-                accepted = result is None
-                self.send_json({"id": req_id, "result": accepted, "error": None if accepted else [22, str(result), None]})
+                rpc_result = rpc_call(
+                    "submitblock",
+                    [bytes_to_hex(block_bytes)],
+                )
+                accepted = rpc_result.ok and rpc_result.result is None
+                submit_error = None
+                if not accepted:
+                    submit_error = [
+                        22,
+                        str(
+                            rpc_result.error
+                            if not rpc_result.ok
+                            else rpc_result.result
+                        ),
+                        None,
+                    ]
+                self.send_json({
+                    "id": req_id,
+                    "result": accepted,
+                    "error": submit_error,
+                })
                 log(
                     f"Block submit: {'accepted' if accepted else 'rejected'} "
                     f"share_diff={share_diff:.3f} hash={header_hash_int:064x}"
