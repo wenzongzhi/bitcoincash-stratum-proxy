@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from ecashaddress import convert
 import base58  # pip install base58
 import socket
 import threading
@@ -32,13 +31,50 @@ from queue import Empty, Full, Queue
 # ===========================
 # === User configuration area (must be modified) ===
 # ===========================
-RPC_USER = "your_rpc_user"       # rpcuser in bitcoin.conf
-RPC_PASS = "your_rpc_password"   # rpcpassword in bitcoin.conf
-RPC_HOST = "127.0.0.1"
-RPC_PORT = 8332
+RPC_USER = os.environ.get("BCH_RPC_USER", "your_rpc_user")
+RPC_PASS = os.environ.get("BCH_RPC_PASSWORD", "your_rpc_password")
+RPC_HOST = os.environ.get("BCH_RPC_HOST", "127.0.0.1")
 
-LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 3333
+# BCHN test-chain profiles. All use testnet Base58 address versions;
+# public test networks use bchtest while regtest uses bchreg.
+NETWORK_PROFILES = {
+    "testnet4": {
+        "rpc_port": 28332,
+        "listen_port": 3334,
+        "cashaddr_prefix": "bchtest",
+    },
+    "scalenet": {
+        "rpc_port": 38332,
+        "listen_port": 3335,
+        "cashaddr_prefix": "bchtest",
+    },
+    "chipnet": {
+        "rpc_port": 48332,
+        "listen_port": 3336,
+        "cashaddr_prefix": "bchtest",
+    },
+    "regtest": {
+        "rpc_port": 18443,
+        "listen_port": 3337,
+        "cashaddr_prefix": "bchreg",
+    },
+}
+NETWORK = os.environ.get("BCH_TEST_NETWORK", "testnet4").strip().lower()
+if NETWORK not in NETWORK_PROFILES:
+    raise ValueError(
+        "BCH_TEST_NETWORK must be one of: "
+        + ", ".join(NETWORK_PROFILES)
+    )
+NETWORK_PROFILE = NETWORK_PROFILES[NETWORK]
+RPC_PORT = int(
+    os.environ.get("BCH_RPC_PORT", NETWORK_PROFILE["rpc_port"])
+)
+
+LISTEN_HOST = os.environ.get("BCH_STRATUM_HOST", "0.0.0.0")
+LISTEN_PORT = int(
+    os.environ.get("BCH_STRATUM_PORT", NETWORK_PROFILE["listen_port"])
+)
+CASHADDR_PREFIX = NETWORK_PROFILE["cashaddr_prefix"]
 
 # Polling interval (seconds), recommended 10-30; shorter intervals result in higher RPC costs.
 GBT_POLL_INTERVAL = 20
@@ -51,7 +87,10 @@ EXTRANONCE2_BYTES = 4
 COINBASE_TAG = b"/BitcoinCash Stratum Proxy/"
 
 # Default payment address (used when the miner does not provide one)
-DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
+DEFAULT_PAYOUT_ADDRESS = os.environ.get(
+    "BCH_PAYOUT_ADDRESS",
+    f"{CASHADDR_PREFIX}:your_testnet_address_here",
+)
 
 # Share difficulty announced to connected miners. 2048 gives Bitaxe and
 # NerdQaxe devices regular health-check shares without affecting solo blocks.
@@ -344,6 +383,20 @@ def rpc_call(method: str, params: Optional[List[Any]] = None) -> RpcResult:
         error=f"RPC transport failed after {RPC_MAX_RETRIES} attempts",
     )
 
+
+def validate_node_network() -> None:
+    """Refuse to mine if the configured BCHN RPC belongs to another chain."""
+    rpc_result = rpc_call("getblockchaininfo")
+    if not rpc_result.ok or not isinstance(rpc_result.result, dict):
+        raise RuntimeError(
+            f"cannot read BCHN chain identity: {rpc_result.error}"
+        )
+    actual_chain = str(rpc_result.result.get("chain", "")).lower()
+    if actual_chain != NETWORK:
+        raise RuntimeError(
+            f"BCHN RPC is on {actual_chain!r}, expected {NETWORK!r}"
+        )
+
 # ===========================
 # === GBT -> Job Conversion and Broadcast ===
 # ===========================
@@ -425,6 +478,96 @@ def build_coinbase_1(height: int, coinbase_aux: Optional[Dict[str, Any]] = None)
     script_length = varint_encode(script_sig_size)
     return version + input_count + null_prevout + script_length + script_prefix.hex()
 
+_CASHADDR_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_CASHADDR_CHARSET_MAP = {
+    char: index for index, char in enumerate(_CASHADDR_CHARSET)
+}
+_CASHADDR_HASH_SIZES = (20, 24, 28, 32, 40, 48, 56, 64)
+
+
+def _cashaddr_polymod(values: List[int]) -> int:
+    checksum = 1
+    generators = (
+        0x98F2BC8E61,
+        0x79B76D99E2,
+        0xF33E5FB3C4,
+        0xAE2EABE2A8,
+        0x1E4F43E470,
+    )
+    for value in values:
+        top = checksum >> 35
+        checksum = ((checksum & 0x07FFFFFFFF) << 5) ^ value
+        for index, generator in enumerate(generators):
+            if (top >> index) & 1:
+                checksum ^= generator
+    return checksum ^ 1
+
+
+def _cashaddr_prefix_values(prefix: str) -> List[int]:
+    return [ord(char) & 0x1f for char in prefix] + [0]
+
+
+def _convert_bits(
+    values: List[int],
+    from_bits: int,
+    to_bits: int,
+    pad: bool,
+) -> List[int]:
+    accumulator = 0
+    bit_count = 0
+    result: List[int] = []
+    max_value = (1 << to_bits) - 1
+    max_accumulator = (1 << (from_bits + to_bits - 1)) - 1
+    for value in values:
+        if value < 0 or value >> from_bits:
+            raise ValueError("CashAddr contains an invalid data value")
+        accumulator = (
+            ((accumulator << from_bits) | value) & max_accumulator
+        )
+        bit_count += from_bits
+        while bit_count >= to_bits:
+            bit_count -= to_bits
+            result.append((accumulator >> bit_count) & max_value)
+    if pad:
+        if bit_count:
+            result.append((accumulator << (to_bits - bit_count)) & max_value)
+    elif bit_count >= from_bits or (
+        (accumulator << (to_bits - bit_count)) & max_value
+    ):
+        raise ValueError("CashAddr has invalid padding")
+    return result
+
+
+def _decode_cashaddr(address: str) -> Tuple[int, bytes]:
+    prefix, payload_text = address.split(':', 1)
+    if prefix != CASHADDR_PREFIX:
+        raise ValueError(
+            f"only {CASHADDR_PREFIX}: CashAddr is supported on {NETWORK}"
+        )
+    if len(payload_text) < 8:
+        raise ValueError("CashAddr payload is too short")
+    try:
+        payload = [_CASHADDR_CHARSET_MAP[char] for char in payload_text]
+    except KeyError as e:
+        raise ValueError("CashAddr contains an invalid character") from e
+    if _cashaddr_polymod(
+        _cashaddr_prefix_values(prefix) + payload
+    ) != 0:
+        raise ValueError("CashAddr checksum is invalid")
+
+    decoded = bytes(_convert_bits(payload[:-8], 5, 8, False))
+    if not decoded:
+        raise ValueError("CashAddr payload is empty")
+    version = decoded[0]
+    if version & 0x80:
+        raise ValueError("CashAddr reserved version bit is set")
+    hash_size = _CASHADDR_HASH_SIZES[version & 0x07]
+    address_hash = decoded[1:]
+    if len(address_hash) != hash_size:
+        raise ValueError("CashAddr hash size does not match its version")
+    return version >> 3, address_hash
+
+
 def _address_to_script_pubkey(payout_address: str) -> str:
     """
     P2PKH
@@ -445,24 +588,38 @@ def _address_to_script_pubkey(payout_address: str) -> str:
         raise ValueError("payout address must not be empty")
 
     # CashAddr is case-insensitive only when the whole address uses one case.
-    # Normalize it because mining software commonly omits "bitcoincash:".
+    # Normalize it because mining software commonly omits the network prefix.
     if ':' in address or address[0].lower() in ('q', 'p'):
         if address.lower() != address and address.upper() != address:
             raise ValueError("CashAddr must not mix uppercase and lowercase")
 
         address = address.lower()
         if ':' not in address:
-            address = 'bitcoincash:' + address
-        elif not address.startswith('bitcoincash:'):
-            raise ValueError("only Bitcoin Cash mainnet CashAddr is supported")
+            address = CASHADDR_PREFIX + ':' + address
+        elif not address.startswith(CASHADDR_PREFIX + ':'):
+            raise ValueError(
+                f"only {CASHADDR_PREFIX}: CashAddr is supported on {NETWORK}"
+            )
+
+    if ':' in address:
+        try:
+            address_type, address_hash = _decode_cashaddr(address)
+        except ValueError as e:
+            raise ValueError(
+                f"invalid Bitcoin Cash payout address: {payout_address}"
+            ) from e
+        payload_hex = address_hash.hex()
+        if address_type == 0:
+            return "76a914" + payload_hex + "88ac"
+        if address_type == 1:
+            return "a914" + payload_hex + "87"
+        raise ValueError(
+            f"unsupported CashAddr type {address_type}; "
+            "only P2PKH and P2SH are supported"
+        )
 
     try:
-        legacy = convert.to_legacy_address(address)
-    except Exception as e:
-        raise ValueError(f"invalid Bitcoin Cash payout address: {payout_address}") from e
-
-    try:
-        decoded = base58.b58decode_check(legacy)
+        decoded = base58.b58decode_check(address)
     except Exception as e:
         raise ValueError(f"invalid legacy payout address: {payout_address}") from e
 
@@ -471,20 +628,22 @@ def _address_to_script_pubkey(payout_address: str) -> str:
 
     version = decoded[0]
     payload_hex = decoded[1:].hex()
-    if version == 0x00:
+    if version == 0x6f:
         return "76a914" + payload_hex + "88ac"
-    if version == 0x05:
+    if version == 0xc4:
         return "a914" + payload_hex + "87"
     raise ValueError(
         f"unsupported payout address network/version 0x{version:02x}; "
-        "Bitcoin Cash mainnet address required"
+        f"Bitcoin Cash {NETWORK} address required"
     )
+
 
 def _validated_payout_address(payout_address: str) -> str:
     """Return a trimmed usable address, raising ValueError when it is invalid."""
     address = payout_address.strip()
     _address_to_script_pubkey(address)
     return address
+
 
 def build_coinbase_2(payout_address: str, coinbase_value: int) -> str:
     """
@@ -1426,6 +1585,16 @@ def main():
     if RPC_USER == "your_rpc_user" or RPC_PASS == "your_rpc_password":
         print("Please configure RPC_USER and RPC_PASS (RPC user/password in bitcoin.conf) at the top of the script first")
         exit(1)
+
+    try:
+        validate_node_network()
+    except RuntimeError as e:
+        print(f"Testnet proxy startup failed: {e}")
+        exit(1)
+    log(
+        f"Network={NETWORK}, BCHN RPC={RPC_HOST}:{RPC_PORT}, "
+        f"Stratum={LISTEN_HOST}:{LISTEN_PORT}"
+    )
     
     # 'daemon=True' means if main thread is end, this child Thread will be killed.
     poller_thread = threading.Thread(target=gbt_poller, daemon=True)
