@@ -21,7 +21,7 @@ accounts, reward accounting, TLS, or distributed pool infrastructure.
 - BIP310 minimum-difficulty, subscribe-extranonce, and info negotiation
 - Standard Stratum share error codes
 - Duplicate share detection
-- Optional block proposal validation before `submitblock`
+- Optional block proposal validation before `submitblock` (disabled by default)
 - BCHN `workid` forwarding
 
 ## Requirements
@@ -76,8 +76,8 @@ Configuration is read from environment variables.
 | Network | `BCH_TEST_NETWORK` | Default RPC port | Default Stratum port | CashAddr prefix |
 | --- | --- | ---: | ---: | --- |
 | Testnet4 | `testnet4` | 28332 | 3334 | `bchtest:` |
-| Scalenet | `scalenet` | 38332 | 3335 | `bchtest:` |
-| Chipnet | `chipnet` | 48332 | 3336 | `bchtest:` |
+| Scalenet | `scale` or `scalenet` | 38332 | 3335 | `bchtest:` |
+| Chipnet | `chip` or `chipnet` | 48332 | 3336 | `bchtest:` |
 | Regtest | `regtest` | 18443 | 3337 | `bchreg:` |
 
 Example for Testnet4:
@@ -218,10 +218,23 @@ The proxy performs the following checks before accepting a share:
 6. Announced Stratum share difficulty
 7. BCH network target
 
-When a share reaches the network target, the proxy builds the full block,
-optionally validates it with GBT proposal mode, and calls `submitblock`.
-Proposal RPC transport failures are fail-open so a valid block candidate is
-still submitted. Explicit proposal rejection stops submission.
+When a share reaches the network target, the proxy builds the full block and
+calls `submitblock`. Optional GBT proposal validation is available for
+diagnostics but is disabled by default to avoid delaying a solved block with
+an extra RPC round trip. When enabled, proposal transport failures are
+fail-open, while explicit proposal rejection stops submission.
+
+After BCHN accepts a block, the proxy returns the normal successful
+`mining.submit` response:
+
+```json
+{"id":123,"result":true,"error":null}
+```
+
+Current Bitaxe and NerdAxe firmware detects a block candidate locally by
+comparing the share difficulty with the network target and displays its native
+block-found notification. No additional non-standard Stratum message is
+required.
 
 ## Tests
 

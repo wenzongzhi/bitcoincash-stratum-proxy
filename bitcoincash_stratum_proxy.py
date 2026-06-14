@@ -56,7 +56,9 @@ DEFAULT_PAYOUT_ADDRESS = "bitcoincash:your_default_address_here"
 # Share difficulty announced to connected miners. 2048 gives Bitaxe and
 # NerdQaxe devices regular health-check shares without affecting solo blocks.
 MIN_SHARE_DIFF = 2_048
-ENABLE_BLOCK_PROPOSAL_CHECK = True
+# Proposal mode is useful for diagnostics, but production solo mining should
+# submit a solved block immediately instead of adding another RPC round trip.
+ENABLE_BLOCK_PROPOSAL_CHECK = False
 
 # Stratum difficulty 1 uses Bitcoin's historical difficulty-1 target.
 DIFF1_TARGET = 0x00000000FFFF0000000000000000000000000000000000000000000000000000
@@ -399,7 +401,7 @@ def build_coinbase_1(height: int, coinbase_aux: Optional[Dict[str, Any]] = None)
 
     The miner constructs the full transaction as:
     coinb1 + extranonce1 + extranonce2 + coinb2.
-    01000000                     version
+    02000000                     version
     01                           input_count
     00...00ffffffff              null_prevout fixed by 32 bytes "00" txid + 4 bytes "ffffffff" vout
     size of coinbase script      include script length and extranonce1 + extranonce2 size
